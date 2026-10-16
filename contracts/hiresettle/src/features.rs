@@ -277,17 +277,8 @@ impl HireSettleContract {
                     .address_val
                     .clone()
                     .unwrap_or_else(|| panic!("missing treasury"));
-                env.storage().persistent().set(
-                    &DataKey::PlatformFee,
-                    &PlatformFee {
-                        bps: pending.u32_val,
-                        treasury: treasury.clone(),
-                    },
-                );
-                env.events().publish(
-                    (Symbol::new(env, "platform_fee_set"),),
-                    (pending.u32_val, treasury),
-                );
+                // Issue #541: a co-signed change still waits out the fee-change delay.
+                Self::set_or_schedule_platform_fee(env, pending.u32_val, treasury);
             }
             FN_SET_TOKEN_ALLOWLIST_ENABLED => {
                 env.storage()

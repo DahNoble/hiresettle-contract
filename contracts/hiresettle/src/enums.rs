@@ -40,6 +40,45 @@ pub enum TimelineKind {
     /// An engagement status transition (`get_status_history`).
     StatusChange,
 }
+/// Who must act next on an engagement, as returned in a
+/// [`crate::NextAction`] by `get_next_action` (issue #556).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum ActorRole {
+    /// The engagement's company (or its registered co-signer).
+    Company,
+    /// The recruiter side: the primary recruiter, its co-signer, or — for a
+    /// split amendment the primary recruiter proposed — the co-recruiter.
+    Recruiter,
+    /// A panel arbiter, or the super arbiter (panel) on an escalated dispute.
+    Arbiter,
+    /// Anyone — the step is a permissionless keeper call.
+    Anyone,
+}
+/// The contract call a [`crate::NextAction`] points at (issue #556).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum ActionKind {
+    /// `unlock_milestone` on a `Locked` retention milestone.
+    UnlockMilestone,
+    /// `submit_proof` / `submit_proof_root` on a `Pending` milestone.
+    SubmitProof,
+    /// `confirm_milestone` (or `raise_dispute`) on a `ProofSubmitted` milestone.
+    ConfirmMilestone,
+    /// `cast_arbiter_vote` / `cast_arbiter_split_vote` on a `Disputed` milestone.
+    CastArbiterVote,
+    /// `escalate_dispute` once a dispute has outlived its window.
+    EscalateDispute,
+    /// `super_arbiter_resolve` on an escalated dispute.
+    ResolveEscalation,
+    /// `resolve_escalation_timeout` once the super arbiter missed its deadline.
+    ResolveEscalationTimeout,
+    /// `force_confirm_milestone` once the company let the confirm window lapse.
+    ForceConfirm,
+    /// Accept (or reject) a pending proposal: a recruiter transfer, a dispute
+    /// window override, a split amendment, or a recruiter exit request.
+    AcceptProposal,
+}
 /// Distinguishes the two business-logic types of milestones.
 #[contracttype]
 #[derive(Clone, PartialEq)]
@@ -160,6 +199,10 @@ pub enum ConfigKey {
     /// Admin-wide cap on a recruiter's active engagements (issue #482).
     /// Absent or `0` ⇒ unlimited.
     MaxActivePerRecruiter,
+    /// Ledgers a scheduled platform-fee change must wait before
+    /// `apply_scheduled_fee` can apply it (issue #541). Absent or `0` ⇒
+    /// `set_platform_fee` applies immediately.
+    FeeChangeDelay,
 }
 /// Contract storage key space. Instance keys reset between transactions;
 /// persistent keys survive across ledgers.
@@ -407,5 +450,11 @@ pub enum DataKey2 {
     /// Compliance-hold reason for (engagement_id, milestone_index) (issue #492).
     /// Present ⇒ the milestone is on hold; absent ⇒ not held.
     MilestoneHold(String, u32),
+    /// Platform-fee change waiting out the fee-change delay (issue #541).
+    ScheduledPlatformFee,
+    /// Recruiter's maximum accepted swap slippage, in basis points, for
+    /// payouts converted into their preferred token (issue #549). Absent ⇒
+    /// `DEFAULT_MAX_SLIPPAGE_BPS`.
+    RecruiterPayoutSlippage(Address),
 }
 
