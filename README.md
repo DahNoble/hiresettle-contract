@@ -2660,3 +2660,6 @@ MIT
 
 <!-- handsoff-issue-619 -->
 - #619: test: add coverage for the dispute cycle cap
+
+<!-- handsoff-issue-622 -->
+- #622: test: add coverage for milestone compliance holds
