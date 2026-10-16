@@ -83,3 +83,11 @@ pub(crate) const DEFAULT_RISK_DISPUTE_WEIGHT: u32 = 30;
 pub(crate) const DEFAULT_RISK_REPLACEMENT_WEIGHT: u32 = 20;
 /// Default risk-score points per granted milestone extension (issue #480).
 pub(crate) const DEFAULT_RISK_EXTENSION_WEIGHT: u32 = 10;
+
+/// Schema version stamped onto every emitted event (issue #585).
+///
+/// Bump this whenever any event's topics or data change so indexers can
+/// detect payload-shape changes instead of breaking silently. The value is
+/// appended as the last topic of every `env.events().publish` call and is
+/// exposed to off-chain consumers via `get_event_schema_version()`.
+pub(crate) const EVENT_SCHEMA_VERSION: u32 = 1;
