@@ -2,6 +2,9 @@
 
 pub(crate) const MAX_PLATFORM_FEE_BPS: u32 = 500;
 pub(crate) const MAX_ARBITER_FEE_BPS: u32 = 200;
+/// Default recruiter swap-slippage tolerance for converted payouts
+/// (issue #549): 100 bps = 1 %.
+pub(crate) const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 100;
 pub(crate) const FULL_SPLIT_BPS: u32 = 10_000;
 /// Upper bound for `set_min_quorum_ratio_bps` (issue #502): 10 000 bps
 /// (100 %) forces a unanimous panel.

@@ -62,7 +62,8 @@
 //! | `DuplicateEmergencySigner` | — | `features::set_emergency_signers` | 1 |
 //! | `DuplicateMilestoneIndex` | — | `disputes::batch_raise_dispute` | 1 |
 //! | `DuplicateMilestoneName` | — | `engagement::create_engagement_impl` | 1 |
-//! | `DuplicateProofHash` | — | `milestones::submit_proof` | 1 |
+//! | `DuplicateProofHash` | — | `milestones::submit_proof_internal` | 1 |
+//! | `EmptyHoldReason` | — | `admin::hold_milestone` | 1 |
 //! | `EmptyIndices` | — | `disputes::batch_raise_dispute`, `milestones::batch_confirm_milestones` | 2 |
 //! | `EmptyPauseReason` | — | `admin::pause_engagement` | 1 |
 //! | `engagement already exists` | — | `engagement::create_engagement_impl` | 1 |
@@ -72,7 +73,8 @@
 //! | `EngagementNotCompleted` | — | `ratings::rate_recruiter` | 1 |
 //! | `EngagementPaused` | `ERR_ENGAGEMENT_PAUSED` | `helpers::assert_engagement_not_paused` | 1 |
 //! | `fee tier not found` | — | `admin::remove_fee_tier` | 1 |
-//! | `FeeTooHigh` | — | `admin::set_platform_fee`, `features::set_fee_rebate_bps` | 2 |
+//! | `FeeChangeDelayNotElapsed` | — | `admin::apply_scheduled_fee` | 1 |
+//! | `FeeTooHigh` | — | `admin::schedule_platform_fee`, `admin::set_platform_fee`, `admin::set_token_platform_fee`, `features::set_fee_rebate_bps` | 4 |
 //! | `HoldReasonTooLong` | — | `admin::hold_milestone` | 1 |
 //! | `Inactivity timeout not reached` | — | `admin::expire_engagement` | 1 |
 //! | `InsufficientCompanyBalance` | — | `features::debit_company_pool`, `features::withdraw_company_balance` | 2 |
@@ -90,6 +92,7 @@
 //! | `InvalidEmergencyThreshold` | — | `features::set_emergency_signers` | 1 |
 //! | `InvalidEmergencyVoteWindow` | — | `features::set_emergency_vote_window` | 1 |
 //! | `InvalidEngagementId` | — | `engagement::create_engagement_impl` | 2 |
+//! | `InvalidFeeFloor` | — | `admin::set_platform_fee_floor` | 1 |
 //! | `InvalidMaxActivePerCompany` | — | `admin::set_max_active_per_company` | 1 |
 //! | `InvalidMetadataHash` | — | `engagement::create_engagement_impl` | 1 |
 //! | `InvalidMinAmount` | — | `admin::set_token_min_amount` | 1 |
@@ -97,6 +100,7 @@
 //! | `InvalidProofHash` | — | `milestones::submit_proof` | 1 |
 //! | `InvalidQuorumRatio` | — | `admin::set_min_quorum_ratio_bps` | 1 |
 //! | `InvalidRating` | — | `ratings::rate_recruiter` | 1 |
+//! | `InvalidSlippageBps` | — | `payout::set_recruiter_payout_slippage` | 1 |
 //! | `InvalidSplitBps` | — | `engagement::create_engagement_impl`, `engagement::propose_split_amendment` | 2 |
 //! | `InvalidSplitPercent` | — | `disputes::cast_arbiter_split_vote` | 1 |
 //! | `InvalidStreamDuration` | — | `engagement::create_engagement_impl` | 1 |
@@ -104,7 +108,7 @@
 //! | `InvalidSuperArbiterResponseWindow` | — | `disputes::set_super_arbiter_deadline` | 1 |
 //! | `JobTitleEmpty` | — | `engagement::create_engagement_impl` | 1 |
 //! | `JobTitleTooLong` | — | `engagement::create_engagement_impl` | 1 |
-//! | `MaxDisputeCyclesReached` | — | `disputes::raise_dispute` | 1 |
+//! | `MaxDisputeCyclesReached` | — | `disputes::apply_dispute_raised` | 1 |
 //! | `milestone is not in disputed status` | — | 6 functions in `disputes` | 6 |
 //! | `milestone is not in ProofSubmitted status` | — | `disputes::force_confirm_milestone` | 1 |
 //! | `milestone is not locked` | — | `milestones::unlock_milestone` | 1 |
@@ -130,6 +134,7 @@
 //! | `no super arbiter configured` | — | `disputes::escalate_dispute`, `disputes::super_arbiter_resolve` | 2 |
 //! | `NoAdmin` | — | `helpers::assert_admin` | 1 |
 //! | `NoPendingDisputeWindowProposal` | — | `disputes::accept_dispute_window_override`, `disputes::reject_dispute_window_override` | 2 |
+//! | `NoScheduledFee` | — | `admin::apply_scheduled_fee`, `admin::cancel_scheduled_fee` | 2 |
 //! | `NoShowDeadlineNotReached` | — | `milestones::trigger_no_show` | 1 |
 //! | `NoShowDisabled` | — | `milestones::trigger_no_show` | 1 |
 //! | `NoStreamedPayout` | — | `milestones::claim_streamed_payout` | 1 |
@@ -143,7 +148,9 @@
 //! | `PreviousMilestoneNotComplete` | — | `helpers::assert_prerequisites_complete`, `milestones::batch_confirm_milestones` | 2 |
 //! | `ProofHashTooLong` | — | `milestones::submit_proof` | 1 |
 //! | `QuorumBelowMinRatio` | — | `engagement::create_engagement_impl` | 1 |
-//! | `ReasonTooLong` | — | `disputes::raise_dispute` | 1 |
+//! | `QuorumUnreachable` | — | `transfers::admin_remove_arbiter` | 1 |
+//! | `ReasonTooLong` | — | `disputes::batch_raise_dispute`, `disputes::raise_dispute` | 2 |
+//! | `RecruiterActiveLimitReached` | — | `engagement::create_engagement_impl` | 1 |
 //! | `RecruiterArbiterCollision` | — | `engagement::create_engagement_impl`, `transfers::admin_add_arbiter` | 2 |
 //! | `referrer already exists` | — | `admin::add_referrer` | 1 |
 //! | `referrer not found` | — | `admin::remove_referrer` | 1 |
@@ -156,6 +163,7 @@
 //! | `RetentionDaysZero` | — | `engagement::create_engagement_impl` | 1 |
 //! | `SplitVotingDisabled` | — | `disputes::cast_arbiter_split_vote` | 1 |
 //! | `SuperArbiterResponseWindowNotElapsed` | — | `disputes::resolve_escalation_timeout` | 1 |
+//! | `SwapOutputBelowMinimum` | — | `payout::try_swap_payout` | 1 |
 //! | `TagEmpty` | — | `engagement::create_engagement_impl` | 1 |
 //! | `TagTooLong` | — | `engagement::create_engagement_impl` | 1 |
 //! | `tier bps exceeds base platform fee` | — | `admin::set_fee_tiers` | 1 |
@@ -166,7 +174,7 @@
 //! | `too many IDs` | — | `queries::batch_get_engagement_summary` | 1 |
 //! | `TooManyMilestones` | — | `engagement::create_engagement_impl` | 1 |
 //! | `TooManyTags` | — | `engagement::create_engagement_impl` | 1 |
-//! | `unauthorized` | `ERR_UNAUTHORIZED` | 29 functions in `admin`, `disputes`, `engagement`, `features`, `helpers`, `milestones`, `ratings`, `transfers` | 30 |
+//! | `unauthorized` | `ERR_UNAUTHORIZED` | 29 functions in `admin`, `disputes`, `engagement`, `features`, `helpers`, `milestones`, `ratings`, `transfers` | 31 |
 //! | `unknown config change fn_id` | — | `features::apply_pending_config_change` | 1 |
 //! | `UpgradeLockNotElapsed` | — | `admin::execute_upgrade` | 1 |
 //! | `VersionTooLong` | — | `admin::set_version` | 1 |
