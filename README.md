@@ -2660,3 +2660,6 @@ MIT
 
 <!-- handsoff-issue-607 -->
 - #607: docs(readme): document engagement bundles
+
+<!-- handsoff-issue-624 -->
+- #624: test: add coverage for the engagement risk score
