@@ -2655,3 +2655,8 @@ The contract uses panic messages (strings) to signal errors instead of a formal 
 MIT
 
 ---
+
+## Handsoff notes
+
+<!-- handsoff-issue-619 -->
+- #619: test: add coverage for the dispute cycle cap
