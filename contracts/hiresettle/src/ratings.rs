@@ -78,6 +78,122 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #567 — ARBITER RATINGS BY PARTIES
+    // ----------------------------------------------------------
+
+    /// A party (company or recruiter) rates an arbiter who voted on a resolved
+    /// dispute for the given engagement/milestone. Each party may rate each
+    /// arbiter at most once per dispute; the rating is added to the arbiter's
+    /// running `RatingSummary`.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused.
+    /// - `"InvalidRating"` — `stars` is outside 1–5.
+    /// - `"unauthorized"` — caller is not a party to the engagement.
+    /// - `"DisputeNotResolved"` — the dispute has not been resolved.
+    /// - `"ArbiterDidNotVote"` — `arbiter` did not vote on this dispute.
+    /// - `"AlreadyRated"` — this party already rated this arbiter for this dispute.
+    ///
+    /// # Events
+    /// Emits `("arbiter_rated", engagement_id)` with `(arbiter, rater, stars)`.
+    pub fn rate_arbiter(
+        env: Env,
+        rater: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        arbiter: Address,
+        stars: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        rater.require_auth();
+
+        if !(MIN_RATING_STARS..=MAX_RATING_STARS).contains(&stars) {
+            panic!("InvalidRating");
+        }
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if !Self::is_authorized_company(&env, &rater, &engagement.company)
+            && rater != engagement.recruiter
+        {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let dispute = Self::get_dispute_internal(&env, &engagement_id, milestone_index);
+        if dispute.status != DisputeStatus::Resolved {
+            panic!("DisputeNotResolved");
+        }
+
+        if !Self::arbiter_voted_on_dispute(&env, &engagement_id, milestone_index, &arbiter) {
+            panic!("ArbiterDidNotVote");
+        }
+
+        let rated_key = DataKey2::ArbiterRated(
+            engagement_id.clone(),
+            milestone_index,
+            rater.clone(),
+            arbiter.clone(),
+        );
+        if env.storage().persistent().has(&rated_key) {
+            panic!("AlreadyRated");
+        }
+        env.storage().persistent().set(&rated_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rated_key, 100_000, 6_300_000);
+
+        let rating_key = DataKey2::ArbiterRating(arbiter.clone());
+        let mut summary: RatingSummary =
+            env.storage()
+                .persistent()
+                .get(&rating_key)
+                .unwrap_or(RatingSummary {
+                    total_stars: 0,
+                    rating_count: 0,
+                });
+        summary.total_stars += stars as u64;
+        summary.rating_count += 1;
+        env.storage().persistent().set(&rating_key, &summary);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rating_key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_rated"), engagement_id),
+            (arbiter, rater, stars),
+        );
+    }
+
+    /// Return the arbiter's accumulated rating, or `None` if they have never
+    /// been rated.
+    pub fn get_arbiter_rating(env: Env, arbiter: Address) -> Option<RatingSummary> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::ArbiterRating(arbiter))
+    }
+
+    /// Admin toggles whether arbiter ratings are blended into the arbiter
+    /// selection weight. Disabled by default.
+    pub fn set_arbiter_rating_weight_enabled(env: Env, admin: Address, enabled: bool) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::ArbiterRatingWeight), &enabled);
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_rating_weight_set"),),
+            enabled,
+        );
+    }
+
+    /// Return whether arbiter ratings are blended into selection weight.
+    pub fn get_arbiter_rating_weight_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::ArbiterRatingWeight))
+            .unwrap_or(false)
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #470 — RATING-BASED PROOF COOLDOWN DISCOUNT
     // ----------------------------------------------------------
 
