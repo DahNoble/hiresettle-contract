@@ -317,6 +317,124 @@ impl HireSettleContract {
             .get(&DataKey2::TokenPlatformFee(token))
     }
 
+    // ----------------------------------------------------------
+    // ISSUE #539 — PER-COMPANY PLATFORM FEE OVERRIDE
+    // ----------------------------------------------------------
+
+    /// Override the base platform-fee bps for every engagement whose company
+    /// is `company`, on every payout path. Takes precedence over the per-token
+    /// override, fee tiers (live or snapshotted) and the global rate; an
+    /// engagement fee waiver still wins over it, and the referral discount,
+    /// fee floor and rebate still apply on top. Capped at 500 bps like
+    /// `set_platform_fee`.
+    ///
+    /// # Panics
+    /// - `"FeeTooHigh"` — `bps` exceeds 500.
+    pub fn set_company_platform_fee(env: Env, admin: Address, company: Address, bps: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if bps > MAX_PLATFORM_FEE_BPS {
+            panic!("FeeTooHigh");
+        }
+        let key = DataKey2::CompanyPlatformFee(company.clone());
+        env.storage().persistent().set(&key, &bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events()
+            .publish((Symbol::new(&env, "company_platform_fee_set"),), (company, bps));
+    }
+
+    /// Remove a company's fee override; its engagements fall back to the
+    /// token / tier / global resolution.
+    pub fn remove_company_platform_fee(env: Env, admin: Address, company: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::CompanyPlatformFee(company.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "company_platform_fee_removed"),), company);
+    }
+
+    /// Return the company's base bps override, if any.
+    pub fn get_company_platform_fee(env: Env, company: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::CompanyPlatformFee(company))
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #540 — MULTI-TREASURY FEE ROUTING
+    // ----------------------------------------------------------
+
+    /// Split every collected platform fee across weighted treasuries. Each
+    /// entry is `(treasury, weight_bps)`; weights must sum to exactly 10 000.
+    /// Rounding dust goes to the first treasury, so the full fee is always
+    /// transferred. Replaces any existing list; while a list is set,
+    /// `PlatformFee.treasury` receives nothing (unless it is in the list).
+    ///
+    /// # Panics
+    /// - `"EmptyTreasuryList"` — `treasuries` is empty (use
+    ///   [`Self::clear_fee_treasuries`] to go back to the single treasury).
+    /// - `"TooManyTreasuries"` — more than 10 entries.
+    /// - `"InvalidTreasuryWeight"` — a weight is zero.
+    /// - `"DuplicateTreasury"` — an address appears twice.
+    /// - `"TreasuryWeightsMustSumTo10000"` — weights do not sum to 10 000.
+    pub fn set_fee_treasuries(env: Env, admin: Address, treasuries: Vec<(Address, u32)>) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if treasuries.is_empty() {
+            panic!("EmptyTreasuryList");
+        }
+        if treasuries.len() > MAX_FEE_TREASURIES {
+            panic!("TooManyTreasuries");
+        }
+        let mut total: u64 = 0;
+        for i in 0..treasuries.len() {
+            let (treasury, weight) = treasuries.get(i).unwrap();
+            if weight == 0 {
+                panic!("InvalidTreasuryWeight");
+            }
+            for j in 0..i {
+                if treasuries.get(j).unwrap().0 == treasury {
+                    panic!("DuplicateTreasury");
+                }
+            }
+            total += weight as u64;
+        }
+        if total != FULL_SPLIT_BPS as u64 {
+            panic!("TreasuryWeightsMustSumTo10000");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey2::FeeTreasuries, &treasuries);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey2::FeeTreasuries, 100_000, 6_300_000);
+        env.events()
+            .publish((Symbol::new(&env, "fee_treasuries_set"),), treasuries);
+    }
+
+    /// Remove the weighted treasury list; fees go to `PlatformFee.treasury`
+    /// again.
+    pub fn clear_fee_treasuries(env: Env, admin: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        env.storage().persistent().remove(&DataKey2::FeeTreasuries);
+        env.events()
+            .publish((Symbol::new(&env, "fee_treasuries_cleared"),), ());
+    }
+
+    /// Return the weighted treasury list, or an empty vector when fees go to
+    /// the single `PlatformFee.treasury`.
+    pub fn get_fee_treasuries(env: Env) -> Vec<(Address, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::FeeTreasuries)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Set the weights used by `get_engagement_risk_score` (issue #480).
     pub fn set_risk_score_weights(
         env: Env,
@@ -1249,7 +1367,8 @@ impl HireSettleContract {
     /// updated by the admin via `set_inactivity_timeout_ledgers`.
     ///
     /// # Behaviour
-    /// - The engagement must not be `Completed`.
+    /// - The engagement must not be `Completed`, `Cancelled` or `Expired`. An `Offered`
+    ///   engagement (issue #569) the recruiter never accepted can be expired.
     /// - Any escrow balance not yet released (`total_amount - released_amount`) is transferred
     ///   back to the company address.
     /// - The engagement status is set to `Expired`.
@@ -1257,6 +1376,8 @@ impl HireSettleContract {
     /// # Panics
     /// - `"Cannot expire completed engagement"` — engagement is already `Completed`.
     /// - `"Inactivity timeout not reached"` — the inactivity threshold has not yet been reached.
+    /// - `"engagement is in a terminal state"` — the engagement is already `Cancelled` or
+    ///   `Expired` (checked after the timeout), so its escrow was already refunded.
     ///
     /// # Events
     /// Emits `("engagement_expired", engagement_id)` with the refund amount.
@@ -1273,6 +1394,13 @@ impl HireSettleContract {
 
         if current_ledger <= engagement.last_activity_ledger + timeout {
             panic!("Inactivity timeout not reached");
+        }
+
+        // A Cancelled or Expired engagement already refunded its unreleased
+        // escrow (without touching `released_amount`), so expiring it again
+        // would pay the same refund out a second time.
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
         }
 
         let refund = engagement.total_amount - engagement.released_amount;
