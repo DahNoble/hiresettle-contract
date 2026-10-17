@@ -62,17 +62,21 @@
 //! | `DuplicateEmergencySigner` | — | `features::set_emergency_signers` | 1 |
 //! | `DuplicateMilestoneIndex` | — | `disputes::batch_raise_dispute` | 1 |
 //! | `DuplicateMilestoneName` | — | `engagement::create_engagement_impl` | 1 |
-//! | `DuplicateProofHash` | — | `milestones::submit_proof` | 1 |
+//! | `DuplicateProofHash` | — | `milestones::submit_proof_internal` | 1 |
+//! | `DuplicateTreasury` | — | `admin::set_fee_treasuries` | 1 |
+//! | `EmptyHoldReason` | — | `admin::hold_milestone` | 1 |
 //! | `EmptyIndices` | — | `disputes::batch_raise_dispute`, `milestones::batch_confirm_milestones` | 2 |
 //! | `EmptyPauseReason` | — | `admin::pause_engagement` | 1 |
+//! | `EmptyTreasuryList` | — | `admin::set_fee_treasuries` | 1 |
 //! | `engagement already exists` | — | `engagement::create_engagement_impl` | 1 |
-//! | `engagement is in a terminal state` | — | `disputes::set_arbiter_vote_delegate`, `transfers::claim_arbiter`, `transfers::get_engagement_for_panel_change`, `transfers::nominate_arbiter_successor` | 4 |
+//! | `engagement is in a terminal state` | — | 5 functions in `admin`, `disputes`, `transfers` | 5 |
 //! | `engagement is not active` | `ERR_ENGAGEMENT_NOT_ACTIVE` | 24 functions in `disputes`, `engagement`, `milestones`, `transfers` | 24 |
 //! | `engagement not found` | — | `helpers::get_engagement_internal` | 1 |
 //! | `EngagementNotCompleted` | — | `ratings::rate_recruiter` | 1 |
+//! | `EngagementNotOffered` | — | `engagement::accept_engagement`, `engagement::withdraw_offer` | 2 |
 //! | `EngagementPaused` | `ERR_ENGAGEMENT_PAUSED` | `helpers::assert_engagement_not_paused` | 1 |
 //! | `fee tier not found` | — | `admin::remove_fee_tier` | 1 |
-//! | `FeeTooHigh` | — | `admin::set_platform_fee`, `features::set_fee_rebate_bps` | 2 |
+//! | `FeeTooHigh` | — | `admin::set_company_platform_fee`, `admin::set_platform_fee`, `admin::set_token_platform_fee`, `features::set_fee_rebate_bps` | 4 |
 //! | `HoldReasonTooLong` | — | `admin::hold_milestone` | 1 |
 //! | `Inactivity timeout not reached` | — | `admin::expire_engagement` | 1 |
 //! | `InsufficientCompanyBalance` | — | `features::debit_company_pool`, `features::withdraw_company_balance` | 2 |
@@ -90,6 +94,7 @@
 //! | `InvalidEmergencyThreshold` | — | `features::set_emergency_signers` | 1 |
 //! | `InvalidEmergencyVoteWindow` | — | `features::set_emergency_vote_window` | 1 |
 //! | `InvalidEngagementId` | — | `engagement::create_engagement_impl` | 2 |
+//! | `InvalidFeeFloor` | — | `admin::set_platform_fee_floor` | 1 |
 //! | `InvalidMaxActivePerCompany` | — | `admin::set_max_active_per_company` | 1 |
 //! | `InvalidMetadataHash` | — | `engagement::create_engagement_impl` | 1 |
 //! | `InvalidMinAmount` | — | `admin::set_token_min_amount` | 1 |
@@ -102,9 +107,10 @@
 //! | `InvalidStreamDuration` | — | `engagement::create_engagement_impl` | 1 |
 //! | `InvalidSuperArbiterPanel` | — | `disputes::set_super_arbiter_panel` | 2 |
 //! | `InvalidSuperArbiterResponseWindow` | — | `disputes::set_super_arbiter_deadline` | 1 |
+//! | `InvalidTreasuryWeight` | — | `admin::set_fee_treasuries` | 1 |
 //! | `JobTitleEmpty` | — | `engagement::create_engagement_impl` | 1 |
 //! | `JobTitleTooLong` | — | `engagement::create_engagement_impl` | 1 |
-//! | `MaxDisputeCyclesReached` | — | `disputes::raise_dispute` | 1 |
+//! | `MaxDisputeCyclesReached` | — | `disputes::apply_dispute_raised` | 1 |
 //! | `milestone is not in disputed status` | — | 6 functions in `disputes` | 6 |
 //! | `milestone is not in ProofSubmitted status` | — | `disputes::force_confirm_milestone` | 1 |
 //! | `milestone is not locked` | — | `milestones::unlock_milestone` | 1 |
@@ -143,7 +149,9 @@
 //! | `PreviousMilestoneNotComplete` | — | `helpers::assert_prerequisites_complete`, `milestones::batch_confirm_milestones` | 2 |
 //! | `ProofHashTooLong` | — | `milestones::submit_proof` | 1 |
 //! | `QuorumBelowMinRatio` | — | `engagement::create_engagement_impl` | 1 |
-//! | `ReasonTooLong` | — | `disputes::raise_dispute` | 1 |
+//! | `QuorumUnreachable` | — | `transfers::admin_remove_arbiter` | 1 |
+//! | `ReasonTooLong` | — | `disputes::batch_raise_dispute`, `disputes::raise_dispute` | 2 |
+//! | `RecruiterActiveLimitReached` | — | `engagement::create_engagement_impl` | 1 |
 //! | `RecruiterArbiterCollision` | — | `engagement::create_engagement_impl`, `transfers::admin_add_arbiter` | 2 |
 //! | `referrer already exists` | — | `admin::add_referrer` | 1 |
 //! | `referrer not found` | — | `admin::remove_referrer` | 1 |
@@ -166,7 +174,9 @@
 //! | `too many IDs` | — | `queries::batch_get_engagement_summary` | 1 |
 //! | `TooManyMilestones` | — | `engagement::create_engagement_impl` | 1 |
 //! | `TooManyTags` | — | `engagement::create_engagement_impl` | 1 |
-//! | `unauthorized` | `ERR_UNAUTHORIZED` | 29 functions in `admin`, `disputes`, `engagement`, `features`, `helpers`, `milestones`, `ratings`, `transfers` | 30 |
+//! | `TooManyTreasuries` | — | `admin::set_fee_treasuries` | 1 |
+//! | `TreasuryWeightsMustSumTo10000` | — | `admin::set_fee_treasuries` | 1 |
+//! | `unauthorized` | `ERR_UNAUTHORIZED` | 31 functions in `admin`, `disputes`, `engagement`, `features`, `helpers`, `milestones`, `ratings`, `transfers` | 33 |
 //! | `unknown config change fn_id` | — | `features::apply_pending_config_change` | 1 |
 //! | `UpgradeLockNotElapsed` | — | `admin::execute_upgrade` | 1 |
 //! | `VersionTooLong` | — | `admin::set_version` | 1 |

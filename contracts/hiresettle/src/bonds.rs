@@ -152,7 +152,8 @@ impl HireSettleContract {
             token_client.transfer(&env.current_contract_address(), &engagement.company, &forfeit);
         }
         if refund > 0 {
-            token_client.transfer(&env.current_contract_address(), &engagement.recruiter, &refund);
+            // Issue #547: credited rather than pushed on pull-payout engagements.
+            Self::pay_or_credit_recruiter(env, engagement, &token_client, &engagement.recruiter, refund);
         }
 
         bond.forfeited = forfeit > 0;
@@ -250,7 +251,7 @@ impl HireSettleContract {
             token_client.transfer(&env.current_contract_address(), &engagement.company, &forfeit);
         }
         if refund > 0 {
-            token_client.transfer(&env.current_contract_address(), &co_recruiter, &refund);
+            Self::pay_or_credit_recruiter(env, engagement, &token_client, &co_recruiter, refund);
         }
 
         bond.forfeited = forfeit > 0;

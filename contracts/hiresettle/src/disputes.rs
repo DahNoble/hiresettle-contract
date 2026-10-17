@@ -459,15 +459,7 @@ impl HireSettleContract {
     ) {
         engagement.released_amount += payment;
 
-        let platform_fee = Self::get_platform_fee_internal(env);
-        let effective_bps = if Self::is_fee_waived_internal(env, engagement_id) {
-            0
-        } else {
-            let base_bps = Self::token_base_bps(env, &engagement.token, platform_fee.bps);
-            let tiered_bps =
-                Self::engagement_tier_bps(env, engagement_id, base_bps, engagement.total_amount);
-            Self::apply_referral_discount(env, tiered_bps, &engagement.referrer)
-        };
+        let effective_bps = Self::payout_fee_bps(env, engagement_id, engagement);
         let platform_fee_amount =
             Self::platform_fee_amount(env, engagement_id, payment, effective_bps);
         let after_platform_fee = payment - platform_fee_amount;
@@ -1220,18 +1212,7 @@ impl HireSettleContract {
             let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
             engagement.released_amount += payment;
 
-            let platform_fee = Self::get_platform_fee_internal(&env);
-            let effective_bps = if Self::is_fee_waived_internal(&env, &engagement_id) {
-                0
-            } else {
-                let tiered_bps = Self::engagement_tier_bps(
-                    &env,
-                    &engagement_id,
-                    Self::token_base_bps(&env, &engagement.token, platform_fee.bps),
-                    engagement.total_amount,
-                );
-                Self::apply_referral_discount(&env, tiered_bps, &engagement.referrer)
-            };
+            let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
             let platform_fee_amount =
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
             let after_platform_fee = payment - platform_fee_amount;
@@ -1467,18 +1448,7 @@ impl HireSettleContract {
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         engagement.released_amount += payment;
 
-        let platform_fee = Self::get_platform_fee_internal(&env);
-        let effective_bps = if Self::is_fee_waived_internal(&env, &engagement_id) {
-            0
-        } else {
-            let tiered_bps = Self::engagement_tier_bps(
-                &env,
-                &engagement_id,
-                Self::token_base_bps(&env, &engagement.token, platform_fee.bps),
-                engagement.total_amount,
-            );
-            Self::apply_referral_discount(&env, tiered_bps, &engagement.referrer)
-        };
+        let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
         let platform_fee_amount =
             Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
         let net_payment = payment - platform_fee_amount;
@@ -1880,13 +1850,7 @@ impl HireSettleContract {
 
         // Release payment identically to confirm_milestone.
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
-        let platform_fee = Self::get_platform_fee_internal(&env);
-        let effective_bps = Self::effective_platform_fee_bps(
-            &env,
-            &engagement_id,
-            Self::token_base_bps(&env, &engagement.token, platform_fee.bps),
-            engagement.total_amount,
-        );
+        let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
         let fee_amount =
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
         let net_payment = payment - fee_amount;
