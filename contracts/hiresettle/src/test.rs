@@ -5,7 +5,7 @@
 //! funds to the company, and calls `init` with the company as admin. Tests
 //! are grouped under `// ====` section banners, mostly one per GitHub issue.
 //!
-//! 422 tests, 168 of them `#[should_panic]` cases asserting on an exact panic
+//! 434 tests, 174 of them `#[should_panic]` cases asserting on an exact panic
 //! message (see the errors reference in `errors.rs`). Recount with
 //! `grep -c '^#\[test\]' src/test.rs` or `cargo test`.
 //!
@@ -26,6 +26,7 @@
 //! | Recruiter active-engagement caps | 12 | issue #482: self-imposed and admin caps, stricter cap wins, slots freed by completion / cancellation, recruiter-only auth |
 //! | Split dispute voting | 12 | issue #462: enable toggle, percent bounds, quorum resolution amounts, weighted panels, fees on the recruiter share only |
 //! | Dispute window overrides | 16 | issue #469: propose / accept / reject by either party, proposal TTL, effective window, `raise_dispute` boundary |
+//! | Arbiter vote deadline | 12 | issue #560: admin-only setter, disabled / early enforcement, recusal of non-voters, recomputed-quorum approve / reject / split settlement, escalation without votes, recused arbiters locked out, missed-deadline stats |
 
 #![cfg(test)]
 extern crate std;
@@ -12657,4 +12658,319 @@ fn test_raise_dispute_allowed_past_global_within_extended_window() {
     advance_ledger(&env, DEFAULT_DISPUTE_WINDOW_LEDGERS + 1);
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "late"));
     assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Disputed);
+}
+
+// ============================================================
+// #560 — arbiter vote deadline with automatic recusal
+// ============================================================
+
+const VOTE_DEADLINE: u32 = 1_000;
+// The escalation test relies on the deadline passing well inside the dispute window.
+const _: () = assert!(VOTE_DEADLINE + 1 < DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+/// Three-arbiter, quorum-2 engagement with milestone 0 already disputed and
+/// a vote deadline of `VOTE_DEADLINE` ledgers configured.
+fn vote_deadline_dispute(
+    env: &Env,
+    client: &HireSettleContractClient,
+    token_id: &Address,
+    company: &Address,
+    recruiter: &Address,
+    id: &str,
+    split_voting: bool,
+) -> (String, Address, Address, Address) {
+    let a1 = Address::generate(env);
+    let a2 = Address::generate(env);
+    let a3 = Address::generate(env);
+    let eng_id = create_split_vote_engagement(
+        env,
+        client,
+        token_id,
+        company,
+        recruiter,
+        ArbiterSetup {
+            arbiters: vec![env, a1.clone(), a2.clone(), a3.clone()],
+            quorum: 2,
+            weights: None,
+        },
+        id,
+    );
+    if split_voting {
+        client.set_split_voting_enabled(company, &eng_id, &true);
+    }
+    client.set_arbiter_vote_deadline(company, &VOTE_DEADLINE);
+    submit_and_dispute(env, client, company, recruiter, &eng_id);
+    (eng_id, a1, a2, a3)
+}
+
+#[test]
+fn test_vote_deadline_defaults_to_disabled_and_is_admin_settable() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_arbiter_vote_deadline(), 0);
+    client.set_arbiter_vote_deadline(&company, &500);
+    assert!(has_event(&env, "arbiter_vote_deadline_set"));
+    assert_eq!(client.get_arbiter_vote_deadline(), 500);
+    client.set_arbiter_vote_deadline(&company, &0);
+    assert_eq!(client.get_arbiter_vote_deadline(), 0);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_set_vote_deadline() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_arbiter_vote_deadline(&recruiter, &500);
+}
+
+#[test]
+#[should_panic(expected = "VoteDeadlineDisabled")]
+fn test_enforce_vote_deadline_panics_when_disabled() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, ..) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-OFF", false,
+    );
+    client.set_arbiter_vote_deadline(&company, &0);
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "VoteDeadlineNotReached")]
+fn test_enforce_vote_deadline_panics_before_deadline() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, ..) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-EARLY", false,
+    );
+    // Exactly at `raised_at + deadline` the deadline has not passed yet.
+    advance_ledger(&env, VOTE_DEADLINE);
+    client.enforce_vote_deadline(&eng_id, &0);
+}
+
+#[test]
+fn test_enforce_vote_deadline_recuses_non_voters_and_settles_approve() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, a1, a2, a3) = vote_deadline_dispute(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        "VD-APPROVE",
+        false,
+    );
+    client.set_arbiter_fee(&company, &200);
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+
+    assert!(has_event(&env, "arbiter_vote_deadline_missed"));
+    assert!(has_event(&env, "vote_deadline_enforced"));
+    // Effective quorum ceil(2 * 1 / 3) = 1, so a1's approval settles it.
+    let engagement = client.get_engagement(&eng_id);
+    assert_eq!(
+        engagement.milestones.get(0).unwrap().status,
+        MilestoneStatus::Resolved
+    );
+    assert_eq!(engagement.released_amount, 1_000_000_000);
+    // No single vote decided the dispute, so no arbiter fee is paid.
+    assert_eq!(token::Client::new(&env, &token_id).balance(&a1), 0);
+    assert!(token::Client::new(&env, &token_id).balance(&recruiter) > 0);
+
+    assert_eq!(
+        client.get_arbiter_stats(&a1).unwrap().missed_vote_deadlines,
+        0
+    );
+    assert_eq!(
+        client.get_arbiter_stats(&a2).unwrap().missed_vote_deadlines,
+        1
+    );
+    assert_eq!(
+        client.get_arbiter_stats(&a3).unwrap().missed_vote_deadlines,
+        1
+    );
+    // Resolution clears the dispute's recusals.
+    assert_eq!(client.get_recused_arbiters(&eng_id, &0).len(), 0);
+}
+
+#[test]
+fn test_enforce_vote_deadline_settles_reject_on_recomputed_quorum() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, a1, ..) = vote_deadline_dispute(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        "VD-REJECT",
+        false,
+    );
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &false);
+    // One reject of three with quorum 2 does not decide the dispute...
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::Disputed
+    );
+
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+
+    // ...but once the two non-voters are recused it does.
+    let milestone = client.get_milestone(&eng_id, &0);
+    assert_eq!(milestone.status, MilestoneStatus::Pending);
+    assert_eq!(milestone.proof_hash, String::from_str(&env, ""));
+    assert_eq!(client.get_engagement(&eng_id).released_amount, 0);
+}
+
+#[test]
+fn test_enforce_vote_deadline_with_split_votes_settles_at_median() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, a1, ..) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-SPLIT", true,
+    );
+
+    client.cast_arbiter_split_vote(&a1, &eng_id, &0, &40);
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+
+    assert!(has_event(&env, "dispute_split_resolved"));
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(token_client.balance(&recruiter), 400_000_000);
+    assert_eq!(
+        token_client.balance(&company),
+        COMPANY_START_BALANCE - 1_000_000_000 + 600_000_000
+    );
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::Resolved
+    );
+}
+
+#[test]
+fn test_enforce_vote_deadline_without_votes_makes_dispute_escalatable() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, a1, a2, a3) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-ESC", false,
+    );
+    let super_arbiter = Address::generate(&env);
+    client.set_super_arbiter(&company, &super_arbiter);
+
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::Disputed
+    );
+    assert_eq!(
+        client.get_recused_arbiters(&eng_id, &0),
+        vec![&env, a1.clone(), a2.clone(), a3.clone()]
+    );
+
+    // Escalation no longer waits for the dispute window.
+    client.escalate_dispute(&eng_id, &0);
+    assert!(client.is_dispute_escalated(&eng_id, &0));
+
+    // Once the super arbiter settles it, a fresh dispute starts with no recusals.
+    client.super_arbiter_resolve(&super_arbiter, &eng_id, &0, &false);
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::Pending
+    );
+    advance_ledger(&env, 31 * 17_280);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    assert_eq!(client.get_recused_arbiters(&eng_id, &0).len(), 0);
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+}
+
+#[test]
+#[should_panic(expected = "ArbiterRecused")]
+fn test_arbiter_recused_by_deadline_cannot_vote() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, a1, ..) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-LATE", false,
+    );
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+}
+
+#[test]
+#[should_panic(expected = "ArbiterRecused")]
+fn test_recused_arbiter_cannot_split_vote() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, a1, ..) = vote_deadline_dispute(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        "VD-SPLIT-LATE",
+        true,
+    );
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+    client.cast_arbiter_split_vote(&a1, &eng_id, &0, &50);
+}
+
+#[test]
+#[should_panic(expected = "NoPendingVoters")]
+fn test_enforce_vote_deadline_twice_panics() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, ..) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-TWICE", false,
+    );
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.enforce_vote_deadline(&eng_id, &0);
+    client.enforce_vote_deadline(&eng_id, &0);
+}
+
+#[test]
+fn test_missed_vote_deadline_lowers_selection_weight() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (first, a1, a2, a3) = vote_deadline_dispute(
+        &env, &client, &token_id, &company, &recruiter, "VD-W1", false,
+    );
+    // a1 answers the first dispute promptly; a2 settles it.
+    client.cast_arbiter_vote(&a1, &first, &0, &true);
+    client.cast_arbiter_vote(&a2, &first, &0, &true);
+
+    let second = create_split_vote_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        ArbiterSetup {
+            arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()],
+            quorum: 2,
+            weights: None,
+        },
+        "VD-W2",
+    );
+    submit_and_dispute(&env, &client, &company, &recruiter, &second);
+    let before = client.get_arbiter_selection_weight(&a1);
+
+    advance_ledger(&env, VOTE_DEADLINE + 1);
+    client.cast_arbiter_vote(&a2, &second, &0, &true);
+    client.enforce_vote_deadline(&second, &0);
+
+    let stats = client.get_arbiter_stats(&a1).unwrap();
+    assert_eq!(stats.disputes_assigned, 2);
+    assert_eq!(stats.votes_cast, 1);
+    assert_eq!(stats.missed_vote_deadlines, 1);
+    // completion falls from 1/2 to 1/3 of assignments.
+    assert!(client.get_arbiter_selection_weight(&a1) < before);
 }

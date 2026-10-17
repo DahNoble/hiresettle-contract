@@ -194,7 +194,9 @@ impl HireSettleContract {
     /// # Formula
     /// - No dispute history yet → `50` (the midpoint), so new members are
     ///   eligible at a neutral weight rather than excluded.
-    /// - Otherwise, with `completion = 100 * votes_cast / disputes_assigned`
+    /// - Otherwise, with `completion = 100 * votes_cast / (disputes_assigned +
+    ///   missed_vote_deadlines)` (a missed vote deadline, issue #560, counts as
+    ///   a second unanswered assignment)
     ///   and `speed = 100 * R / (R + avg_response_ledgers)` where `R` is
     ///   17 280 ledgers (~1 day; `speed` is 100 for instant votes, 50 at a
     ///   one-day average, and 0 if the arbiter never voted):
@@ -226,7 +228,8 @@ impl HireSettleContract {
             return DEFAULT_ARBITER_SELECTION_WEIGHT;
         }
         let votes = stats.votes_cast.min(stats.disputes_assigned) as u64;
-        let completion = votes * 100 / stats.disputes_assigned as u64;
+        let assigned = stats.disputes_assigned as u64 + stats.missed_vote_deadlines as u64;
+        let completion = votes * 100 / assigned;
         let speed = stats.total_response_ledgers.checked_div(votes).map_or(0, |avg| {
             100 * ARBITER_RESPONSE_REFERENCE_LEDGERS / (ARBITER_RESPONSE_REFERENCE_LEDGERS + avg)
         });
@@ -241,6 +244,7 @@ impl HireSettleContract {
                 disputes_assigned: 0,
                 votes_cast: 0,
                 total_response_ledgers: 0,
+                missed_vote_deadlines: 0,
             })
     }
 
@@ -276,6 +280,13 @@ impl HireSettleContract {
         let mut stats = Self::load_arbiter_stats(env, arbiter);
         stats.votes_cast += 1;
         stats.total_response_ledgers += now.saturating_sub(raised_at) as u64;
+        Self::store_arbiter_stats(env, arbiter, &stats);
+    }
+
+    /// Record that `arbiter` was recused for missing a vote deadline (issue #560).
+    pub(crate) fn record_missed_vote_deadline(env: &Env, arbiter: &Address) {
+        let mut stats = Self::load_arbiter_stats(env, arbiter);
+        stats.missed_vote_deadlines += 1;
         Self::store_arbiter_stats(env, arbiter, &stats);
     }
 }

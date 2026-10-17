@@ -168,6 +168,9 @@ pub enum ConfigKey {
     /// Admin-wide cap on a recruiter's active engagements (issue #482).
     /// Absent or `0` ⇒ unlimited.
     MaxActivePerRecruiter,
+    /// Ledgers after a dispute is raised before `enforce_vote_deadline` may
+    /// recuse non-voting arbiters (issue #560). Absent or `0` ⇒ disabled.
+    ArbiterVoteDeadline,
 }
 /// Contract storage key space. Instance keys reset between transactions;
 /// persistent keys survive across ledgers.
@@ -426,5 +429,10 @@ pub enum DataKey2 {
     FeeTreasuries,
     /// Per-company base platform-fee bps override (issue #539).
     CompanyPlatformFee(Address),
+    /// Set once `enforce_vote_deadline` has run on (engagement_id,
+    /// milestone_index) and left the dispute undecided (issue #560); lets
+    /// `escalate_dispute` skip the dispute-window wait. Cleared with the
+    /// dispute's recusals.
+    VoteDeadlineEnforced(String, u32),
 }
 
