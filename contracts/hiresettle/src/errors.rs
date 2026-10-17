@@ -102,6 +102,7 @@
 //! | `InvalidProofHash` | — | `milestones::submit_proof` | 1 |
 //! | `InvalidQuorumRatio` | — | `admin::set_min_quorum_ratio_bps` | 1 |
 //! | `InvalidRating` | — | `ratings::rate_recruiter` | 1 |
+//! | `InvalidSlippageBps` | — | `payout::set_recruiter_payout_slippage` | 1 |
 //! | `InvalidSplitBps` | — | `engagement::create_engagement_impl`, `engagement::propose_split_amendment` | 2 |
 //! | `InvalidSplitPercent` | — | `disputes::cast_arbiter_split_vote` | 1 |
 //! | `InvalidStreamDuration` | — | `engagement::create_engagement_impl` | 1 |
@@ -136,7 +137,7 @@
 //! | `no super arbiter configured` | — | `disputes::escalate_dispute`, `disputes::super_arbiter_resolve` | 2 |
 //! | `NoAdmin` | — | `helpers::assert_admin` | 1 |
 //! | `NoPendingDisputeWindowProposal` | — | `disputes::accept_dispute_window_override`, `disputes::reject_dispute_window_override` | 2 |
-//! | `NoPendingVoters` | — | `disputes::enforce_vote_deadline` | 1 |
+//! | `NoScheduledFee` | — | `admin::apply_scheduled_fee`, `admin::cancel_scheduled_fee` | 2 |
 //! | `NoShowDeadlineNotReached` | — | `milestones::trigger_no_show` | 1 |
 //! | `NoShowDisabled` | — | `milestones::trigger_no_show` | 1 |
 //! | `NoStreamedPayout` | — | `milestones::claim_streamed_payout` | 1 |
@@ -165,6 +166,7 @@
 //! | `RetentionDaysZero` | — | `engagement::create_engagement_impl` | 1 |
 //! | `SplitVotingDisabled` | — | `disputes::cast_arbiter_split_vote` | 1 |
 //! | `SuperArbiterResponseWindowNotElapsed` | — | `disputes::resolve_escalation_timeout` | 1 |
+//! | `SwapOutputBelowMinimum` | — | `payout::try_swap_payout` | 1 |
 //! | `TagEmpty` | — | `engagement::create_engagement_impl` | 1 |
 //! | `TagTooLong` | — | `engagement::create_engagement_impl` | 1 |
 //! | `tier bps exceeds base platform fee` | — | `admin::set_fee_tiers` | 1 |

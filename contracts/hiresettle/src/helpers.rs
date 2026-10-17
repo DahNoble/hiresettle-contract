@@ -436,17 +436,17 @@ impl HireSettleContract {
     /// Panics `"PreviousMilestoneNotComplete"` unless every prerequisite of
     /// `milestone` is `Confirmed` or `Resolved`.
     pub(crate) fn assert_prerequisites_complete(engagement: &Engagement, milestone: &Milestone) {
-        for j in 0..milestone.prerequisites.len() {
-            let prereq = engagement
-                .milestones
-                .get(milestone.prerequisites.get(j).unwrap())
-                .unwrap();
-            if prereq.status != MilestoneStatus::Confirmed
-                && prereq.status != MilestoneStatus::Resolved
-            {
-                panic!("PreviousMilestoneNotComplete");
-            }
+        if !Self::prerequisites_complete(engagement, milestone) {
+            panic!("PreviousMilestoneNotComplete");
         }
+    }
+
+    /// Whether every prerequisite of `milestone` is `Confirmed` or `Resolved`.
+    pub(crate) fn prerequisites_complete(engagement: &Engagement, milestone: &Milestone) -> bool {
+        milestone.prerequisites.iter().all(|idx| {
+            let status = engagement.milestones.get(idx).unwrap().status;
+            status == MilestoneStatus::Confirmed || status == MilestoneStatus::Resolved
+        })
     }
 
     // ----------------------------------------------------------
