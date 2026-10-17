@@ -1,18 +1,29 @@
 use soroban_sdk::{contractclient, contractimpl, token, Address, Env, String, Symbol};
 use crate::*;
 
-/// Interface a trusted swap-adapter contract must implement (issue #458).
+/// Interface a trusted swap-adapter contract must implement (issues #458, #549).
 ///
-/// Before calling `swap`, HireSettle transfers `amount_in` of `from_token` to
-/// the adapter. The adapter must deliver the swapped `to_token` amount to
-/// `recipient` and return it, or panic — a panic reverts the whole payout.
+/// HireSettle first calls `quote` for the expected output, derives
+/// `min_out = quote * (10_000 - max_slippage_bps) / 10_000` from the
+/// recipient's slippage tolerance, then calls `swap`. Inside `swap` the
+/// adapter pulls `amount_in` of `from_token` from `payer` (HireSettle
+/// pre-authorizes exactly that `transfer(payer, adapter, amount_in)`),
+/// delivers the swapped `to_token` amount to `recipient` and returns it.
+///
+/// If the adapter cannot deliver at least `min_out` it must panic. HireSettle
+/// invokes `swap` with `try_`, so the panic rolls back the adapter's pull and
+/// the payout falls back to the original token instead of failing.
 #[contractclient(name = "SwapAdapterClient")]
 pub trait SwapAdapter {
+    fn quote(env: Env, from_token: Address, to_token: Address, amount_in: i128) -> i128;
+
     fn swap(
         env: Env,
+        payer: Address,
         from_token: Address,
         to_token: Address,
         amount_in: i128,
+        min_out: i128,
         recipient: Address,
     ) -> i128;
 }
@@ -43,12 +54,16 @@ impl HireSettleContract {
     }
 
     /// Recruiter clears their payout token preference; payouts revert to the
-    /// engagement's escrow token.
+    /// engagement's escrow token. Also resets their slippage tolerance to the
+    /// default (issue #549).
     pub fn clear_recruiter_payout_token(env: Env, recruiter: Address) {
         recruiter.require_auth();
         env.storage()
             .persistent()
             .remove(&DataKey2::RecruiterPayoutToken(recruiter.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::RecruiterPayoutSlippage(recruiter.clone()));
         env.events()
             .publish((Symbol::new(&env, "payout_token_cleared"), recruiter), ());
     }
@@ -58,6 +73,42 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .get(&DataKey2::RecruiterPayoutToken(recruiter))
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #549 — SWAP SLIPPAGE PROTECTION
+    // ----------------------------------------------------------
+
+    /// Recruiter sets the maximum slippage, in basis points, they accept when
+    /// a payout is swapped into their preferred token. Leaves the token
+    /// preference itself untouched. `10_000` accepts any output.
+    ///
+    /// # Panics
+    /// - `"InvalidSlippageBps"` — `max_slippage_bps` exceeds 10 000.
+    ///
+    /// # Events
+    /// `("payout_slippage_set", recruiter)` with `max_slippage_bps`.
+    pub fn set_recruiter_payout_slippage(env: Env, recruiter: Address, max_slippage_bps: u32) {
+        recruiter.require_auth();
+        if max_slippage_bps > FULL_SPLIT_BPS {
+            panic!("InvalidSlippageBps");
+        }
+        let key = DataKey2::RecruiterPayoutSlippage(recruiter.clone());
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(&key, 100_000, 6_300_000);
+        env.events().publish(
+            (Symbol::new(&env, "payout_slippage_set"), recruiter),
+            max_slippage_bps,
+        );
+    }
+
+    /// Return the recruiter's slippage tolerance in basis points, or
+    /// `DEFAULT_MAX_SLIPPAGE_BPS` (100 = 1 %) if they never set one.
+    pub fn get_recruiter_payout_slippage(env: Env, recruiter: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::RecruiterPayoutSlippage(recruiter))
+            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS)
     }
 
     /// Admin registers the trusted swap-adapter contract used to convert
@@ -90,8 +141,14 @@ impl HireSettleContract {
 
     /// Pay `amount` of the escrow token owed to `recipient`, swapping it into
     /// the recipient's preferred payout token first when both a preference and
-    /// a swap adapter are configured. An adapter failure panics, reverting the
-    /// whole call (fee transfers included) rather than paying out partially.
+    /// a swap adapter are configured.
+    ///
+    /// Issue #549: the swap must deliver at least the `min_out` derived from
+    /// the adapter's quote and the recipient's slippage tolerance. If the
+    /// quote fails or the adapter cannot meet `min_out`, the original token is
+    /// paid instead and `payout_swap_fallback` is emitted, so the confirmation
+    /// still succeeds. An adapter that reports success below `min_out` breaks
+    /// the [`SwapAdapter`] contract and the whole call panics.
     pub(crate) fn pay_recruiter_share(
         env: &Env,
         token_client: &token::Client,
@@ -111,16 +168,21 @@ impl HireSettleContract {
             (Some(to_token), Some(adapter))
                 if amount > 0 && to_token != token_client.address =>
             {
-                token_client.transfer(&env.current_contract_address(), &adapter, &amount);
-                let amount_out = SwapAdapterClient::new(env, &adapter).swap(
-                    &token_client.address,
+                let min_out = match Self::try_swap_payout(
+                    env,
+                    token_client,
+                    &adapter,
                     &to_token,
-                    &amount,
                     recipient,
-                );
+                    amount,
+                ) {
+                    Ok(()) => return,
+                    Err(min_out) => min_out,
+                };
+                token_client.transfer(&env.current_contract_address(), recipient, &amount);
                 env.events().publish(
-                    (Symbol::new(env, "payout_swapped"), recipient.clone()),
-                    (token_client.address.clone(), to_token, amount, amount_out),
+                    (Symbol::new(env, "payout_swap_fallback"), recipient.clone()),
+                    (token_client.address.clone(), to_token, amount, min_out),
                 );
             }
             _ => {

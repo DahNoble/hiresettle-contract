@@ -1,7 +1,7 @@
 //! Contract data structs (`#[contracttype]`).
 
 use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
-use crate::{EngagementStatus, MilestoneKind, MilestoneStatus, TimelineKind};
+use crate::{ActionKind, ActorRole, EngagementStatus, MilestoneKind, MilestoneStatus, TimelineKind};
 
 /// A payment and workflow checkpoint belonging to an [`Engagement`]'s `milestones`.
 #[contracttype]
@@ -252,6 +252,18 @@ pub struct PlatformFee {
     pub bps: u32,
     /// Address that receives accumulated platform fees.
     pub treasury: Address,
+}
+/// Platform-fee change scheduled by `schedule_platform_fee` (issue #541),
+/// applied by `apply_scheduled_fee` once `effective_after_ledger` is reached.
+#[contracttype]
+#[derive(Clone)]
+pub struct ScheduledPlatformFee {
+    /// New fee in basis points, capped at 500 (5%).
+    pub bps: u32,
+    /// New treasury address.
+    pub treasury: Address,
+    /// Ledger at or after which `apply_scheduled_fee` may apply the change.
+    pub effective_after_ledger: u32,
 }
 /// A single fee-tier bracket: engagements whose `total_amount` is at or above
 /// `threshold` pay `bps` instead of the default platform-fee rate.
@@ -570,4 +582,22 @@ pub struct RiskScoreWeights {
     pub replacement_weight: u32,
     /// Points per granted milestone extension.
     pub extension_weight: u32,
+}
+
+/// The next actionable step on an engagement, returned by `get_next_action`
+/// (issue #556).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NextAction {
+    /// Who has to make the call.
+    pub actor: ActorRole,
+    /// Which call to make.
+    pub action: ActionKind,
+    /// The milestone the call targets; `None` for engagement-level proposals.
+    pub milestone_index: Option<u32>,
+    /// Earliest ledger at which the call succeeds. Equals the current ledger
+    /// when it can be made right away; otherwise
+    /// `available_at_ledger - current_ledger` is the wait (e.g. the
+    /// `ledgers_until_unlock` of a locked milestone).
+    pub available_at_ledger: u32,
 }
