@@ -1,7 +1,4 @@
-use soroban_sdk::{
-    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
-    contractclient, contractimpl, token, vec, Address, Env, IntoVal, Symbol,
-};
+use soroban_sdk::{contractclient, contractimpl, token, Address, Env, String, Symbol};
 use crate::*;
 
 /// Interface a trusted swap-adapter contract must implement (issues #458, #549).
@@ -194,65 +191,120 @@ impl HireSettleContract {
         }
     }
 
-    /// Attempt the slippage-bounded swap for one payout. Returns `Err(min_out)`
-    /// (`0` when no quote was obtained) when the payout must fall back to the
-    /// escrow token; nothing has moved in that case, because the adapter pulls
-    /// the funds inside its own `swap` frame and a failed `try_swap` rolls
-    /// that pull back.
-    fn try_swap_payout(
+    // ----------------------------------------------------------
+    // ISSUE #547 — PULL-BASED PAYOUTS
+    // ----------------------------------------------------------
+
+    /// Withdraw everything credited to `recruiter` in `token` by
+    /// `pull_payouts` engagements, and return the amount transferred. Works
+    /// for primary recruiters and co-recruiters alike, and covers milestone
+    /// payouts, streamed-payout claims and bond refunds across every
+    /// engagement. Returns `0` without transferring when nothing is owed.
+    ///
+    /// Credited balances are always in the engagement's escrow token; the
+    /// payout token preference (issue #458) is not applied.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused.
+    ///
+    /// # Events
+    /// `("payouts_claimed", recruiter)` with `(token, amount)` when `amount > 0`.
+    pub fn claim_payouts(env: Env, recruiter: Address, token: Address) -> i128 {
+        Self::assert_not_paused(&env);
+        recruiter.require_auth();
+
+        let key = DataKey2::RecruiterClaimable(recruiter.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return 0;
+        }
+        env.storage().persistent().remove(&key);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recruiter,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "payouts_claimed"), recruiter),
+            (token, amount),
+        );
+        amount
+    }
+
+    /// Amount of `token` credited to `recruiter` and not yet claimed.
+    pub fn get_claimable_payout(env: Env, recruiter: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::RecruiterClaimable(recruiter, token))
+            .unwrap_or(0)
+    }
+
+    /// Whether an engagement was created with `pull_payouts`.
+    pub fn is_pull_payouts_enabled(env: Env, engagement_id: String) -> bool {
+        Self::is_pull_payouts_internal(&env, &engagement_id)
+    }
+
+    pub(crate) fn is_pull_payouts_internal(env: &Env, engagement_id: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::PullPayouts(engagement_id.clone()))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn mark_pull_payouts(env: &Env, engagement_id: &String) {
+        let key = DataKey2::PullPayouts(engagement_id.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    /// Add `amount` to `recipient`'s claimable `token` balance. No-op for a
+    /// non-positive amount.
+    ///
+    /// Emits `("payout_credited", recipient)` with `(engagement_id, token, amount)`.
+    pub(crate) fn credit_claimable_payout(
         env: &Env,
+        engagement_id: &String,
+        recipient: &Address,
+        token: &Address,
+        amount: i128,
+    ) {
+        if amount <= 0 {
+            return;
+        }
+        let key = DataKey2::RecruiterClaimable(recipient.clone(), token.clone());
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events().publish(
+            (Symbol::new(env, "payout_credited"), recipient.clone()),
+            (engagement_id.clone(), token.clone(), amount),
+        );
+    }
+
+    /// Send a recruiter-side amount that is not a milestone payout (e.g. a
+    /// bond refund): credited on `pull_payouts` engagements, transferred
+    /// otherwise.
+    pub(crate) fn pay_or_credit_recruiter(
+        env: &Env,
+        engagement: &Engagement,
         token_client: &token::Client,
-        adapter: &Address,
-        to_token: &Address,
         recipient: &Address,
         amount: i128,
-    ) -> Result<(), i128> {
-        let from_token = token_client.address.clone();
-        let adapter_client = SwapAdapterClient::new(env, adapter);
-
-        let quote = match adapter_client.try_quote(&from_token, to_token, &amount) {
-            Ok(Ok(q)) if q > 0 => q,
-            _ => return Err(0),
-        };
-        let slippage_bps = Self::get_recruiter_payout_slippage(env.clone(), recipient.clone());
-        let keep_bps = (FULL_SPLIT_BPS - slippage_bps) as i128;
-        let min_out = quote
-            .checked_mul(keep_bps)
-            .map(|v| v / FULL_SPLIT_BPS as i128)
-            // Only reachable for quotes near i128::MAX; round down instead.
-            .unwrap_or((quote / FULL_SPLIT_BPS as i128) * keep_bps);
-
-        let this = env.current_contract_address();
-        env.authorize_as_current_contract(vec![
-            env,
-            InvokerContractAuthEntry::Contract(SubContractInvocation {
-                context: ContractContext {
-                    contract: from_token.clone(),
-                    fn_name: Symbol::new(env, "transfer"),
-                    args: (this.clone(), adapter.clone(), amount).into_val(env),
-                },
-                sub_invocations: vec![env],
-            }),
-        ]);
-
-        let amount_out = match adapter_client.try_swap(
-            &this,
-            &from_token,
-            to_token,
-            &amount,
-            &min_out,
-            recipient,
-        ) {
-            Ok(Ok(out)) => out,
-            _ => return Err(min_out),
-        };
-        if amount_out < min_out {
-            panic!("SwapOutputBelowMinimum");
+    ) {
+        if Self::is_pull_payouts_internal(env, &engagement.id) {
+            Self::credit_claimable_payout(
+                env,
+                &engagement.id,
+                recipient,
+                &token_client.address,
+                amount,
+            );
+        } else {
+            token_client.transfer(&env.current_contract_address(), recipient, &amount);
         }
-        env.events().publish(
-            (Symbol::new(env, "payout_swapped"), recipient.clone()),
-            (from_token, to_token.clone(), amount, amount_out),
-        );
-        Ok(())
     }
 }

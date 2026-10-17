@@ -506,9 +506,13 @@ Passed at creation to stay within Soroban's 10-parameter limit:
 - `metadata_hash` (Option<String>), `contract_pdf_hash` (Option<String>)
 - `co_recruiter` (Option<Address>), `recruiter_split_bps` (u32)
 - `is_public` (bool) — opt the engagement into `get_public_engagement_ids`. Set once at creation and cannot be changed afterwards. See [Engagement visibility](#engagement-visibility).
+- `pull_payouts` (bool) — credit payouts to a claimable balance instead of transferring them. Default `false`. See [Pull payouts](#pull-payouts-547).
+- `require_recruiter_acceptance` (bool) — create the engagement as an `Offered` offer the recruiter must accept. Default `false`. See [Recruiter acceptance](#recruiter-acceptance-569).
 
 ### `EngagementStatus`
 `Active` → `Completed` | `Cancelled` | `Expired` | `ReplacementRequested` | `ExitRequested`
+
+`Offered` → `Active` (recruiter accepts) | `Cancelled` (company withdraws) | `Expired`. Only engagements created with `require_recruiter_acceptance` start as `Offered`.
 
 ### `EngagementSummary`
 
@@ -666,7 +670,7 @@ gross_share = total_amount × payment_percent ÷ 100
 fee_amount = gross_share × platform_fee_bps ÷ 10_000
 net_payment = gross_share − fee_amount // this is what the recruiter actually receives
 
-`fee_amount` is transferred to `treasury`; a `platform_fee_collected` event `(milestone_index, fee_amount, treasury)` is emitted whenever `fee_amount > 0` (no event when the fee is 0). Approved disputes (`cast_arbiter_vote`, `cast_arbiter_split_vote`, `super_arbiter_resolve`) also deduct the platform fee, then take the arbiter fee from what is left (see `set_arbiter_fee`). Not every payout path applies fee tiers and the referral discount the same way; see [Which fee reductions apply on each payout path](#which-fee-reductions-apply-on-each-payout-path).
+`fee_amount` is transferred to `treasury`; a `platform_fee_collected` event `(milestone_index, fee_amount, treasury)` is emitted whenever `fee_amount > 0` (no event when the fee is 0). Approved disputes (`cast_arbiter_vote`, `cast_arbiter_split_vote`, `super_arbiter_resolve`) also deduct the platform fee, then take the arbiter fee from what is left (see `set_arbiter_fee`). Every payout path resolves the rate the same way; see [Which fee reductions apply on each payout path](#which-fee-reductions-apply-on-each-payout-path). When [multiple treasuries](#multiple-treasuries-540) are configured, the fee is split across them instead and one `platform_fee_collected` event is emitted per treasury.
 
 When fee tiers are configured, `platform_fee_bps` in the formula above is the **resolved** rate for that engagement's `total_amount` (see [Fee tiers](#fee-tiers)), not necessarily the base `PlatformFee.bps` returned by `get_platform_fee()`.
 
@@ -731,14 +735,13 @@ Admin setup:
   engagement’s `referrer` is on that list (max 500 bps, same cap as the platform
   fee). Default discount is `0`.
 
-On `confirm_milestone` the contract computes an **effective** platform-fee
-rate as follows. Other payout paths skip some of these steps; see
-[Which fee reductions apply on each payout path](#which-fee-reductions-apply-on-each-payout-path).
-An admin [fee waiver](#fee-waiver) overrides all of them.
+On every payout path the contract computes an **effective** platform-fee
+rate as follows. An admin [fee waiver](#fee-waiver) overrides all of them.
 
-1. Start from the configured platform fee `bps` (or the matching **fee tier**
-   rate when `set_fee_tiers` is in use — larger `total_amount` can qualify for a
-   lower tier `bps`).
+1. Start from the base rate: the [company override](#per-company-fee-override-539)
+   if one is set, otherwise the per-token override (or the global platform fee
+   `bps`) run through the matching **fee tier** when `set_fee_tiers` is in use —
+   larger `total_amount` can qualify for a lower tier `bps`.
 2. If `engagement.referrer` is `Some(addr)` **and** `addr` is in the recognised
    referrer list, subtract `referral_discount_bps` from that rate.
 3. Floor at `0` (the platform fee never goes negative).
@@ -789,6 +792,48 @@ Event: `("platform_fee_waived", engagement_id)` with data `(admin,)`.
 client.waive_platform_fee(&admin, &engagement_id);
 assert!(client.is_fee_waived(&engagement_id));
 ```
+
+### Per-company fee override (#539)
+
+The admin can give one company a negotiated base rate that applies to every engagement it owns, on every payout path (`confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, and every dispute resolution).
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `set_company_platform_fee(admin, company, bps)` | Admin | Set the company's base rate. Same 500 bps cap as `set_platform_fee`. | `ContractPaused`, `NoAdmin`, `unauthorized`, `FeeTooHigh` |
+| `remove_company_platform_fee(admin, company)` | Admin | Remove the override; the company falls back to the token / tier / global resolution. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_company_platform_fee(company)` → `Option<u32>` | Anyone | Return the override, if any. | — |
+
+Base-rate precedence, highest first:
+
+1. Engagement [fee waiver](#fee-waiver) — the fee is `0`.
+2. Company override.
+3. Per-token override (`set_token_platform_fee`) run through the fee tiers (live, or the [snapshot](#snapshot-mode-505)). As before, a matching tier replaces the token base.
+4. Global `PlatformFee.bps` run through the fee tiers.
+
+The company override also replaces a tier snapshot. The referral discount, the fee floor and the rebate still apply on top. The override follows the engagement's current `company`, so after `transfer_company` the new company's override applies.
+
+Events: `("company_platform_fee_set",)` with `(company, bps)`; `("company_platform_fee_removed",)` with `company`.
+
+### Multiple treasuries (#540)
+
+By default every fee goes to `PlatformFee.treasury`. The admin can instead split fees across several weighted treasuries, for example an operations wallet, an insurance fund and a grants pool.
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `set_fee_treasuries(admin, treasuries)` | Admin | Replace the list with `Vec<(Address, u32)>` of `(treasury, weight_bps)`. At most 10 entries, no zero weights, no duplicate addresses, weights summing to exactly 10 000. | `ContractPaused`, `NoAdmin`, `unauthorized`, `EmptyTreasuryList`, `TooManyTreasuries`, `InvalidTreasuryWeight`, `DuplicateTreasury`, `TreasuryWeightsMustSumTo10000` |
+| `clear_fee_treasuries(admin)` | Admin | Remove the list; fees go to `PlatformFee.treasury` again. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_fee_treasuries()` → `Vec<(Address, u32)>` | Anyone | Return the list; empty when unset. | — |
+
+The amount owed to the treasury (after any fee rebate credit from `set_fee_rebate_bps`) is split like this:
+
+```text
+share_i (i ≥ 1) = amount × weight_i ÷ 10_000        (rounded down)
+share_0         = amount − Σ share_i                (the first treasury gets the dust)
+```
+
+So the shares always add up to the full fee. While a list is set, `PlatformFee.treasury` receives nothing unless it is in the list, and `get_platform_fee()` still returns it unchanged.
+
+Events: one `("platform_fee_collected", engagement_id)` per treasury, in list order, with `(milestone_index, share, treasury)`. `share` is what that treasury received. With no list set, the single event still reports `(milestone_index, fee_amount, treasury)` as before. `set_fee_treasuries` emits `("fee_treasuries_set",)` with the list; `clear_fee_treasuries` emits `("fee_treasuries_cleared",)`.
 
 ### `DataKey`
 
@@ -911,6 +956,10 @@ All `DataKey2` entries are persistent.
 | `StatusHistory(engagement_id)` | Every engagement status transition; last 50 (#501) |
 | `FeeTierSnapshot(engagement_id)` | Fee bps frozen at creation for `snapshot_fee_tier` engagements (#505) |
 | `CoRecruiterBond(engagement_id)` | Co-recruiter collateral bond (#506) |
+| `RecruiterClaimable(recipient, token)` | Payouts credited by `pull_payouts` engagements, not yet claimed (#547) |
+| `PullPayouts(engagement_id)` | Whether the engagement credits payouts instead of pushing them (#547) |
+| `FeeTreasuries` | Weighted fee treasuries `Vec<(Address, u32)>` (#540) |
+| `CompanyPlatformFee(company)` | Per-company base platform-fee override (#539) |
 
 ---
 
@@ -1102,6 +1151,46 @@ co_forfeit = co_bond × bond_forfeit_bps × (10_000 − recruiter_split_bps) ÷ 
 
 ---
 
+## Pull Payouts (#547)
+
+By default every payout is pushed to the recruiter and co-recruiter inside the confirming transaction. If a recipient cannot receive the token, for example because it has no trustline or its balance is frozen, the whole confirmation reverts and the company cannot confirm.
+
+Setting `EngagementConfig::pull_payouts = true` at creation switches the engagement to a claim model. Every amount that would be transferred to the recruiter side is instead credited to `RecruiterClaimable(recipient, token)`. That covers milestone payouts on every confirmation and dispute path, streamed-payout claims and bond refunds. A confirmation then never fails because of the recipient's account.
+
+| Function | Caller | Description |
+|---|---|---|
+| `claim_payouts(recruiter, token)` → `i128` | Recruiter or co-recruiter (must sign) | Transfer everything credited in `token` across all engagements, and return the amount. Returns `0` without transferring when nothing is owed. Fails with `ContractPaused` while paused. If the account still cannot receive, the claim reverts and the balance stays credited. |
+| `get_claimable_payout(recruiter, token)` → `i128` | Anyone | Amount credited and not yet claimed. |
+| `is_pull_payouts_enabled(engagement_id)` → `bool` | Anyone | Whether the engagement credits instead of pushing. |
+
+Notes:
+
+- Credits are in the engagement's escrow token. The [payout token preference](#which-write-function-do-i-call) (`set_recruiter_payout_token`) is not applied to credited amounts.
+- Fees, arbiter fees and refunds to the company are still transferred immediately.
+- The flag is set once at creation and stored under `DataKey2::PullPayouts(engagement_id)`. It does not change the `Engagement` record.
+
+Events: `("payout_credited", recipient)` with `(engagement_id, token, amount)`; `("payouts_claimed", recruiter)` with `(token, amount)`.
+
+## Recruiter Acceptance (#569)
+
+`create_engagement` normally locks escrow and makes the engagement `Active` straight away, without the recruiter agreeing to the terms. Setting `EngagementConfig::require_recruiter_acceptance = true` creates it in the `Offered` status instead. The escrow (and any bonds) are still locked at creation.
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `accept_engagement(recruiter, engagement_id)` | Recruiter or their cosigner | `Offered` → `Active`. Placement milestones' no-show clocks start at acceptance. Retention unlock ledgers stay as computed at creation. | `ContractPaused`, `EngagementPaused`, `EngagementNotOffered`, `unauthorized` |
+| `withdraw_offer(company, engagement_id)` | Company or its cosigner | `Offered` → `Cancelled`. Refunds the full escrow (to the pool for pool-funded engagements), returns any bonds, and frees the cap slot. | `ContractPaused`, `EngagementPaused`, `EngagementNotOffered`, `unauthorized` |
+
+While `Offered`:
+
+- No milestone action is accepted: `submit_proof`, confirmations, disputes, `top_up_escrow`, `cancel_engagement` and the rest fail with `engagement is not active`.
+- The engagement counts against the per-company cap (`set_max_active_per_company`) and the recruiter caps (`set_recruiter_active_cap`, `set_max_active_per_recruiter`).
+- Status queries list it under `Offered`, never under `Active` (`get_engagement_ids_by_status`, `get_engagement_count_by_status`, summaries).
+- An offer the recruiter never accepts can be closed by `expire_engagement` once the inactivity timeout passes, with a full refund.
+
+Events: `("engagement_offered", engagement_id)` with `(company, recruiter, total_amount)` after `engagement_created`; `("engagement_accepted", engagement_id)` with `recruiter`; `("offer_withdrawn", engagement_id)` with the refund. Acceptance and withdrawal also emit `status_changed` and are recorded in `get_status_history`.
+
+---
+
 ## Feedback Ratings
 
 Once an engagement reaches `Completed`, each side may rate the other once:
@@ -1208,6 +1297,7 @@ engagement is quarantined.
 | I want to… | Call |
 |---|---|
 | Open an engagement and fund escrow | `create_engagement` |
+| Withdraw an offer the recruiter has not accepted | `withdraw_offer` |
 | Open an engagement with arbiters drawn from the admin pool | `create_engagement_random_panel` |
 | Register an arbiter panel to share across several engagements | `create_engagement_bundle` |
 | Add funds to an engagement's escrow | `top_up_escrow` |
@@ -1226,7 +1316,9 @@ engagement is quarantined.
 
 | I want to… | Call |
 |---|---|
+| Accept an engagement offered to me | `accept_engagement` |
 | Submit proof that a milestone is done | `submit_proof` |
+| Withdraw payouts credited by `pull_payouts` engagements | `claim_payouts` |
 | Submit several evidence items as one proof | `submit_proof_root` (Merkle root) |
 | Withdraw the vested part of a streamed milestone payout | `claim_streamed_payout` |
 | Get paid in a different token | `set_recruiter_payout_token` / `clear_recruiter_payout_token` |
@@ -1277,7 +1369,8 @@ holds, so a keeper or either party can run them.
 | Freeze, or unfreeze, a single engagement | `pause_engagement` / `unpause_engagement` |
 | Set up the emergency M-of-N pause | `set_emergency_signers`, `set_emergency_vote_window`; signers then vote with `cast_emergency_pause_vote` |
 | Require a second signer on sensitive setters | `set_config_cosigner`, `set_sensitive_functions`; the cosigner approves each change with `accept_config_change` |
-| Set platform fees | `set_platform_fee`, `set_fee_tiers`, `remove_fee_tier`, `waive_platform_fee`, `set_fee_rebate_bps` |
+| Set platform fees | `set_platform_fee`, `set_fee_tiers`, `remove_fee_tier`, `waive_platform_fee`, `set_fee_rebate_bps`, `set_token_platform_fee`, `set_company_platform_fee` / `remove_company_platform_fee` |
+| Split fees across several treasuries | `set_fee_treasuries` / `clear_fee_treasuries` |
 | Manage referrals | `add_referrer`, `remove_referrer`, `set_referral_discount_bps` |
 | Control which tokens and amounts are accepted | `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`, `set_min_amount`, `set_token_min_amount`, `remove_token_min_amount` |
 | Tune timing windows | `set_confirm_window`, `set_dispute_window`, `set_proof_cooldown`, `set_cooldown_rating_discount`, `set_no_show_deadline_ledgers`, `set_amendment_ttl`, `set_super_arbiter_deadline` |
@@ -1301,6 +1394,12 @@ Functions that manage contract-wide settings, admin succession, and operational 
 | `waive_platform_fee(admin, engagement_id)` | Admin | Permanently zero the platform fee for future payouts on one engagement. Overrides base fee, tiers and referral discount. Not blocked by pause. See [Fee waiver](#fee-waiver). | `NoAdmin`, `unauthorized`, `engagement not found` |
 | `is_fee_waived(engagement_id)` → `bool` | Anyone | Return `true` if the engagement's platform fee is waived. Unknown IDs return `false`. | — |
 | `get_fee_tiers()` → `Vec<FeeTier>` | Anyone | Return configured tiers; empty vec means flat base fee. | — |
+| `set_company_platform_fee(admin, company, bps)` | Admin | Override the base fee rate for one company (max 500). See [Per-company fee override](#per-company-fee-override-539). | `ContractPaused`, `NoAdmin`, `unauthorized`, `FeeTooHigh` |
+| `remove_company_platform_fee(admin, company)` | Admin | Remove a company's override. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_company_platform_fee(company)` → `Option<u32>` | Anyone | Return a company's override, if any. | — |
+| `set_fee_treasuries(admin, treasuries)` | Admin | Split fees across weighted treasuries. See [Multiple treasuries](#multiple-treasuries-540). | `ContractPaused`, `NoAdmin`, `unauthorized`, `EmptyTreasuryList`, `TooManyTreasuries`, `InvalidTreasuryWeight`, `DuplicateTreasury`, `TreasuryWeightsMustSumTo10000` |
+| `clear_fee_treasuries(admin)` | Admin | Go back to the single `PlatformFee.treasury`. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_fee_treasuries()` → `Vec<(Address, u32)>` | Anyone | Return the weighted treasuries; empty when unset. | — |
 | `set_version(admin, version)` | Admin | Set a version label (max 32 chars); does not check upgrade or storage compatibility. | `NoAdmin`, `unauthorized`, `VersionTooLong` |
 | `set_min_amount(admin, amount)` | Admin | Set minimum engagement amount in raw token units. | `NoAdmin`, `unauthorized` |
 | `pause(admin)` | Admin | Pause all state-changing operations. | `NoAdmin`, `unauthorized` |
@@ -1329,7 +1428,7 @@ and verify an explicit migration before deploying such a change. Deployment and
 upgrade procedures will be documented in `DEPLOYMENT.md` when that guide exists.
 
 ### Engagement Lifecycle
-`create_engagement`, `unlock_milestone`, `notify_milestone_due_soon`, `submit_proof`, `submit_proof_root`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`, `propose_recruiter_transfer`, `accept_recruiter_transfer`
+`create_engagement`, `accept_engagement`, `withdraw_offer`, `unlock_milestone`, `notify_milestone_due_soon`, `submit_proof`, `submit_proof_root`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`, `propose_recruiter_transfer`, `accept_recruiter_transfer`, `claim_payouts`
 
 ### Multi-Item Proof (Merkle Root)
 
@@ -2113,6 +2212,11 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | Event | Topics | Payload | Trigger |
 |---|---|---|---|
 | `engagement_created` | `engagement_id` | `engagement_id` | `create_engagement` |
+| `engagement_offered` | `engagement_id` | `(company, recruiter, total_amount)` | `create_engagement` with `require_recruiter_acceptance` |
+| `engagement_accepted` | `engagement_id` | `recruiter` | `accept_engagement` |
+| `offer_withdrawn` | `engagement_id` | `refund` | `withdraw_offer` |
+| `payout_credited` | `recipient` | `(engagement_id, token, amount)` | Any payout on a `pull_payouts` engagement |
+| `payouts_claimed` | `recruiter` | `(token, amount)` | `claim_payouts` |
 | `engagement_cancelled` | `engagement_id` | `refund` | `cancel_engagement` (company + recruiter) |
 | `engagement_expired` | `engagement_id` | `refund` | `expire_engagement` (permissionless keeper) |
 | `engagement_completed` | `engagement_id` | `(engagement_id, released_amount, ledger)` | Final milestone confirmed |
@@ -2133,7 +2237,7 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `milestone_confirmed` | `engagement_id` | `(milestone_index, payment)` | `confirm_milestone` / `batch_confirm_milestones` |
 | `milestone_force_confirmed` | `engagement_id` | `(milestone_index, payment)` | `force_confirm_milestone` (permissionless after window) |
 | `milestone_status_changed` | `engagement_id` | `(milestone_index, old_status, new_status)` | Any milestone status transition |
-| `platform_fee_collected` | `engagement_id` | `(milestone_index, fee_amount, treasury)` | Milestone confirmation when fee > 0 |
+| `platform_fee_collected` | `engagement_id` | `(milestone_index, fee_amount, treasury)` | Milestone confirmation when fee > 0. With [multiple treasuries](#multiple-treasuries-540), one event per treasury with that treasury's share as the amount |
 
 ### Dispute
 
@@ -2386,18 +2490,18 @@ Each milestone's share is rounded down on its own. The shares therefore add up t
 
 ### Which fee reductions apply on each payout path
 
-The payout paths don't compute the effective platform-fee rate the same way. This table describes the code as it currently behaves:
+Every payout path resolves the effective platform-fee rate through the same helper, so the fee waiver, company override, per-token override, fee tiers (or snapshot) and referral discount apply identically everywhere. Every path also collects the fee the same way, so the fee rebate and multi-treasury routing apply everywhere. Only the arbiter fee differs:
 
-| Payout path | Fee waiver | Fee tiers | Referral discount | Arbiter fee |
-|---|---|---|---|---|
-| `confirm_milestone` | ✓ | ✓ | ✓ | — |
-| `batch_confirm_milestones` | ✓ | ✓ | ✗ | — |
-| `force_confirm_milestone` | ✓ | ✓ | ✗ | — |
-| `cast_arbiter_vote` (approve) / `cast_arbiter_split_vote` | ✓ | ✗ | ✓ | ✓ |
-| `super_arbiter_resolve` (approve) | ✓ | ✓ | ✓ | ✓ |
-| `resolve_escalation_timeout` | ✓ | ✓ | ✓ | — |
+| Payout path | Platform fee (all reductions) | Arbiter fee |
+|---|---|---|
+| `confirm_milestone` | ✓ | — |
+| `batch_confirm_milestones` | ✓ | — |
+| `force_confirm_milestone` | ✓ | — |
+| `cast_arbiter_vote` (approve) / `cast_arbiter_split_vote` | ✓ | ✓ |
+| `super_arbiter_resolve` (approve) | ✓ | ✓ |
+| `resolve_escalation_timeout` | ✓ | — |
 
-The ✗ cells are gaps, not documented intent. For example, a referred engagement pays the full tiered rate if its milestones are confirmed through `batch_confirm_milestones`, but the discounted rate through `confirm_milestone`. Integrators who quote fees up front should assume the higher of the two until these paths are unified.
+Before #539, `batch_confirm_milestones` and `force_confirm_milestone` skipped the referral discount, and `batch_confirm_milestones` paid the treasury directly without the fee rebate.
 
 ### Overflow
 
@@ -2565,12 +2669,19 @@ The contract uses panic messages (strings) to signal errors instead of a formal 
 |---|---|---|
 | `Cannot expire completed engagement` | `expire_engagement` | The engagement is already `Completed` and cannot expire. Expiry only applies to non-terminal states. |
 | `Inactivity timeout not reached` | `expire_engagement` | The inactivity threshold has not been met yet. Wait for `get_inactivity_timeout_ledgers()` ledgers since `last_activity_ledger` before expiring. |
+| `engagement is in a terminal state` | `expire_engagement` | The engagement is already `Cancelled` or `Expired`, so its escrow was already refunded. Checked after the timeout. |
+| `EngagementNotOffered` | `accept_engagement` or `withdraw_offer` | The engagement is not in `Offered` status: it was created without `require_recruiter_acceptance`, or the offer was already accepted, withdrawn or expired. |
 
 ### Configuration & Arbiter
 
 | Message | Triggered by | Condition |
 |---|---|---|
-| `FeeTooHigh` | `set_platform_fee` | Platform fee `bps > 500` (5%). The fee is capped at 5% for safety. |
+| `FeeTooHigh` | `set_platform_fee`, `set_token_platform_fee` or `set_company_platform_fee` | Platform fee `bps > 500` (5%). The fee is capped at 5% for safety. |
+| `EmptyTreasuryList` | `set_fee_treasuries` | The list is empty. Use `clear_fee_treasuries` to go back to the single treasury. |
+| `TooManyTreasuries` | `set_fee_treasuries` | More than 10 treasuries. |
+| `InvalidTreasuryWeight` | `set_fee_treasuries` | A treasury has weight `0`. |
+| `DuplicateTreasury` | `set_fee_treasuries` | The same address appears more than once. |
+| `TreasuryWeightsMustSumTo10000` | `set_fee_treasuries` | The weights do not add up to exactly 10 000 bps. |
 | `discount too high` | `set_referral_discount_bps` | Referral discount `bps > 500`. The discount cannot exceed the maximum platform fee. |
 | `too many fee tiers` | `set_fee_tiers` | More than 10 fee tiers provided. Limit to ≤ 10 tiers. |
 | `tier bps exceeds base platform fee` | `set_fee_tiers` | A tier's `bps` is higher than the current base platform fee. Tiers must be discounts (lower bps), not surcharges. |
@@ -2655,3 +2766,14 @@ The contract uses panic messages (strings) to signal errors instead of a formal 
 MIT
 
 ---
+
+## Handsoff notes
+
+<!-- handsoff-issue-579 -->
+- #579: feat: get_engagements_by_created_range query — filter by creation ledger
+
+<!-- handsoff-issue-580 -->
+- #580: feat: recruiter profile aggregate query
+
+<!-- handsoff-issue-582 -->
+- #582: feat: get_protocol_stats query — global totals for dashboards

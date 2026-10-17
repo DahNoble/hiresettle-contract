@@ -586,6 +586,10 @@ impl HireSettleContract {
     /// Collect a platform fee with rebate offset + rebate credit (issue #475).
     /// When rebate_bps is 0 and no prior rebate balance exists, behaviour is
     /// identical to a direct treasury transfer.
+    ///
+    /// When weighted fee treasuries are configured (issue #540), the amount
+    /// owed to the treasury is split across them instead; see
+    /// [`Self::route_fee_to_treasuries`].
     pub(crate) fn collect_platform_fee(
         env: &Env,
         engagement: &Engagement,
@@ -596,7 +600,6 @@ impl HireSettleContract {
         if fee_amount <= 0 {
             return;
         }
-        let platform_fee = Self::get_platform_fee_internal(env);
         let rebate_key =
             DataKey2::CompanyRebate(engagement.company.clone(), engagement.token.clone());
         let mut rebate: i128 = env.storage().persistent().get(&rebate_key).unwrap_or(0);
@@ -619,6 +622,24 @@ impl HireSettleContract {
             .persistent()
             .extend_ttl(&rebate_key, 100_000, 6_300_000);
 
+        let treasuries: Vec<(Address, u32)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FeeTreasuries)
+            .unwrap_or_else(|| Vec::new(env));
+        if !treasuries.is_empty() {
+            Self::route_fee_to_treasuries(
+                env,
+                engagement,
+                engagement_id,
+                milestone_index,
+                to_treasury,
+                &treasuries,
+            );
+            return;
+        }
+
+        let platform_fee = Self::get_platform_fee_internal(env);
         if to_treasury > 0 {
             token::Client::new(env, &engagement.token).transfer(
                 &env.current_contract_address(),
@@ -634,5 +655,49 @@ impl HireSettleContract {
             ),
             (milestone_index, fee_amount, platform_fee.treasury),
         );
+    }
+
+    /// Split `amount` across weighted fee treasuries (issue #540). Every
+    /// treasury but the first gets `amount * weight / 10_000` rounded down;
+    /// the first gets the remainder, so the rounding dust lands there and the
+    /// shares always sum to `amount` exactly.
+    ///
+    /// Emits one `("platform_fee_collected", engagement_id)` event per
+    /// treasury, in configured order, with `(milestone_index, share,
+    /// treasury)`, where `share` is what that treasury received.
+    fn route_fee_to_treasuries(
+        env: &Env,
+        engagement: &Engagement,
+        engagement_id: &String,
+        milestone_index: u32,
+        amount: i128,
+        treasuries: &Vec<(Address, u32)>,
+    ) {
+        let full = FULL_SPLIT_BPS as i128;
+        let mut first_share = amount;
+        for i in 1..treasuries.len() {
+            let (_, weight) = treasuries.get(i).unwrap();
+            first_share -= (amount * weight as i128) / full;
+        }
+
+        let token_client = token::Client::new(env, &engagement.token);
+        for i in 0..treasuries.len() {
+            let (treasury, weight) = treasuries.get(i).unwrap();
+            let share = if i == 0 {
+                first_share
+            } else {
+                (amount * weight as i128) / full
+            };
+            if share > 0 {
+                token_client.transfer(&env.current_contract_address(), &treasury, &share);
+            }
+            env.events().publish(
+                (
+                    Symbol::new(env, "platform_fee_collected"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, share, treasury),
+            );
+        }
     }
 }

@@ -130,6 +130,14 @@ pub enum EngagementStatus {
     ///
     /// Terminal state.
     Expired,
+
+    /// Created with `EngagementConfig::require_recruiter_acceptance`
+    /// (issue #569): escrow is locked but the recruiter has not yet agreed to
+    /// the terms. `accept_engagement` moves it to `Active`; `withdraw_offer`
+    /// refunds the company and moves it to `Cancelled`. No milestone action is
+    /// accepted while the engagement is in this state. Counts against the
+    /// company and recruiter active-engagement caps.
+    Offered,
 }
 /// Discriminator for a single admin-configurable scalar setting, nested inside
 /// `DataKey::Config` so each setting is still its own distinct storage key.
@@ -450,11 +458,16 @@ pub enum DataKey2 {
     /// Compliance-hold reason for (engagement_id, milestone_index) (issue #492).
     /// Present ⇒ the milestone is on hold; absent ⇒ not held.
     MilestoneHold(String, u32),
-    /// Platform-fee change waiting out the fee-change delay (issue #541).
-    ScheduledPlatformFee,
-    /// Recruiter's maximum accepted swap slippage, in basis points, for
-    /// payouts converted into their preferred token (issue #549). Absent ⇒
-    /// `DEFAULT_MAX_SLIPPAGE_BPS`.
-    RecruiterPayoutSlippage(Address),
+    /// Payout credited to a recipient under `pull_payouts`, keyed by
+    /// (recipient, token) and drained by `claim_payouts` (issue #547).
+    RecruiterClaimable(Address, Address),
+    /// Whether an engagement credits payouts instead of transferring them
+    /// (issue #547). Absent ⇒ push payouts.
+    PullPayouts(String),
+    /// Weighted platform-fee treasuries `Vec<(Address, u32)>` (issue #540).
+    /// Absent ⇒ every fee goes to `PlatformFee.treasury`.
+    FeeTreasuries,
+    /// Per-company base platform-fee bps override (issue #539).
+    CompanyPlatformFee(Address),
 }
 

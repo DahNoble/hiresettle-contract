@@ -447,18 +447,7 @@ impl HireSettleContract {
         let full_share = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let payment = full_share - milestone.replacement_paid_out;
         if payment > 0 {
-            let platform_fee = Self::get_platform_fee_internal(&env);
-            let effective_bps = if Self::is_fee_waived_internal(&env, &engagement_id) {
-                0
-            } else {
-                let tiered_bps = Self::engagement_tier_bps(
-                    &env,
-                    &engagement_id,
-                    Self::token_base_bps(&env, &engagement.token, platform_fee.bps),
-                    engagement.total_amount,
-                );
-                Self::apply_referral_discount(&env, tiered_bps, &engagement.referrer)
-            };
+            let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
             let fee_amount =
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
             let net_payment = payment - fee_amount;
@@ -645,13 +634,7 @@ impl HireSettleContract {
             }
         }
 
-        let platform_fee = Self::get_platform_fee_internal(&env);
-        let effective_bps = Self::effective_platform_fee_bps(
-            &env,
-            &engagement_id,
-            Self::token_base_bps(&env, &engagement.token, platform_fee.bps),
-            engagement.total_amount,
-        );
+        let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
         let token_client = token::Client::new(&env, &engagement.token);
 
         for i in 0..milestone_indices.len() {
@@ -665,18 +648,7 @@ impl HireSettleContract {
             engagement.released_amount += payment;
 
             if fee_amount > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &platform_fee.treasury,
-                    &fee_amount,
-                );
-                env.events().publish(
-                    (
-                        Symbol::new(&env, "platform_fee_collected"),
-                        engagement_id.clone(),
-                    ),
-                    (idx, fee_amount, platform_fee.treasury.clone()),
-                );
+                Self::collect_platform_fee(&env, &engagement, &engagement_id, idx, fee_amount);
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client, true);
 
