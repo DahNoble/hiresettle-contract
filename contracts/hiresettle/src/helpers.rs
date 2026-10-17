@@ -173,19 +173,40 @@ impl HireSettleContract {
             .unwrap_or(false)
     }
 
-    /// Resolve the effective platform-fee bps for a milestone payout,
-    /// collapsing to 0 when the engagement has an active fee waiver
-    /// (issue #335). Otherwise defers to `engagement_tier_bps`.
-    pub(crate) fn effective_platform_fee_bps(
+    /// Platform-fee bps charged on a payout from `engagement`, shared by
+    /// every confirmation and dispute-resolution path.
+    ///
+    /// Base-rate precedence: a fee waiver (issue #335) charges 0; otherwise a
+    /// per-company override (issue #539) replaces everything below it;
+    /// otherwise the per-token base (issue #479) is run through the fee tiers
+    /// or the creation-time tier snapshot (issues #250, #505). The referral
+    /// discount (issue #251) applies on top; the fee floor and rebate are
+    /// applied later by `platform_fee_amount` and `collect_platform_fee`.
+    pub(crate) fn payout_fee_bps(
         env: &Env,
         engagement_id: &String,
-        base_bps: u32,
-        total_amount: i128,
+        engagement: &Engagement,
     ) -> u32 {
         if Self::is_fee_waived_internal(env, engagement_id) {
             return 0;
         }
-        Self::engagement_tier_bps(env, engagement_id, base_bps, total_amount)
+        let base_bps = match env
+            .storage()
+            .persistent()
+            .get::<DataKey2, u32>(&DataKey2::CompanyPlatformFee(engagement.company.clone()))
+        {
+            Some(bps) => bps,
+            None => {
+                let global_bps = Self::get_platform_fee_internal(env).bps;
+                Self::engagement_tier_bps(
+                    env,
+                    engagement_id,
+                    Self::token_base_bps(env, &engagement.token, global_bps),
+                    engagement.total_amount,
+                )
+            }
+        };
+        Self::apply_referral_discount(env, base_bps, &engagement.referrer)
     }
 
 
@@ -485,6 +506,10 @@ impl HireSettleContract {
     /// When `apply_payout_preference` is `true`, each payee's share is routed
     /// through `pay_recruiter_share`, swapping it into their preferred payout
     /// token if one is set and a swap adapter is configured (issue #458).
+    ///
+    /// On a `pull_payouts` engagement (issue #547) each share is credited to
+    /// the payee's claimable balance in the escrow token instead, so nothing
+    /// is transferred and no payout token preference is applied.
     pub(crate) fn distribute_recruiter_payout(
         env: &Env,
         engagement: &Engagement,
@@ -492,8 +517,17 @@ impl HireSettleContract {
         token_client: &token::Client,
         apply_payout_preference: bool,
     ) {
+        let pull = Self::is_pull_payouts_internal(env, &engagement.id);
         let pay = |recipient: &Address, amount: i128| {
-            if apply_payout_preference {
+            if pull {
+                Self::credit_claimable_payout(
+                    env,
+                    &engagement.id,
+                    recipient,
+                    &token_client.address,
+                    amount,
+                );
+            } else if apply_payout_preference {
                 Self::pay_recruiter_share(env, token_client, recipient, amount);
             } else {
                 token_client.transfer(&env.current_contract_address(), recipient, &amount);

@@ -5,7 +5,7 @@
 //! funds to the company, and calls `init` with the company as admin. Tests
 //! are grouped under `// ====` section banners, mostly one per GitHub issue.
 //!
-//! 368 tests, 142 of them `#[should_panic]` cases asserting on an exact panic
+//! 422 tests, 168 of them `#[should_panic]` cases asserting on an exact panic
 //! message (see the errors reference in `errors.rs`). Recount with
 //! `grep -c '^#\[test\]' src/test.rs` or `cargo test`.
 //!
@@ -22,14 +22,19 @@
 //! | Cross-cutting edge cases | 17 | the `ADDITIONAL COMPREHENSIVE TEST COVERAGE` section |
 //! | Timeline, fee snapshot, co-recruiter bond & panel resize | 33 | issues #501 and #505–#507 |
 //! | Proof Merkle roots | 22 | issue #486: `submit_proof_root` vs `submit_proof` parity, root storage and replacement, `verify_proof_inclusion` valid / tampered / wrong-path cases |
+//! | Payout tokens & swap adapter | 11 | issue #458: `MockSwapAdapter`, swapped vs direct payout, clearing the adapter or preference, admin-only adapter changes |
+//! | Recruiter active-engagement caps | 12 | issue #482: self-imposed and admin caps, stricter cap wins, slots freed by completion / cancellation, recruiter-only auth |
+//! | Split dispute voting | 12 | issue #462: enable toggle, percent bounds, quorum resolution amounts, weighted panels, fees on the recruiter share only |
+//! | Dispute window overrides | 16 | issue #469: propose / accept / reject by either party, proposal TTL, effective window, `raise_dispute` boundary |
 
 #![cfg(test)]
 extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
-    contract, contractimpl, token, vec, Address, Bytes, BytesN, Env, String, Symbol, TryIntoVal,
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    contract, contractimpl, token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol,
+    TryIntoVal,
     Vec,
 };
 
@@ -186,6 +191,8 @@ fn default_config() -> EngagementConfig {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     }
 }
 
@@ -1407,6 +1414,8 @@ fn test_metadata_hash_present() {
             fund_from_pool: false,
             snapshot_fee_tier: false,
             co_recruiter_bond_amount: None,
+            pull_payouts: false,
+            require_recruiter_acceptance: false,
         },
     );
 
@@ -1467,6 +1476,8 @@ fn test_metadata_hash_empty_string_rejected() {
             fund_from_pool: false,
             snapshot_fee_tier: false,
             co_recruiter_bond_amount: None,
+            pull_payouts: false,
+            require_recruiter_acceptance: false,
         },
     );
 }
@@ -1496,6 +1507,8 @@ fn test_co_recruiter_60_40_split() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -1590,6 +1603,8 @@ fn test_split_bps_over_10000_rejected() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -1632,6 +1647,8 @@ fn test_co_recruiter_gets_remainder() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -1689,6 +1706,8 @@ fn test_co_recruiter_summary_fields() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -1735,6 +1754,8 @@ fn test_split_bps_10000_accepted() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -7395,6 +7416,8 @@ fn test_co_recruiter_split_with_platform_fee() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -7810,6 +7833,8 @@ fn test_co_recruiter_split_with_odd_percentage_remainder() {
         fund_from_pool: false,
         snapshot_fee_tier: false,
         co_recruiter_bond_amount: None,
+        pull_payouts: false,
+        require_recruiter_acceptance: false,
     };
 
     client.create_engagement(
@@ -9223,6 +9248,8 @@ fn test_split_amendment_applies_to_future_not_past() {
             fund_from_pool: false,
             snapshot_fee_tier: false,
             co_recruiter_bond_amount: None,
+            pull_payouts: false,
+            require_recruiter_acceptance: false,
         },
     );
 
@@ -9277,6 +9304,8 @@ fn test_split_amendment_proposer_cannot_accept() {
             fund_from_pool: false,
             snapshot_fee_tier: false,
             co_recruiter_bond_amount: None,
+            pull_payouts: false,
+            require_recruiter_acceptance: false,
         },
     );
     client.propose_split_amendment(&recruiter, &eng_id, &5_000);
@@ -9302,6 +9331,8 @@ fn test_split_amendment_expires() {
             fund_from_pool: false,
             snapshot_fee_tier: false,
             co_recruiter_bond_amount: None,
+            pull_payouts: false,
+            require_recruiter_acceptance: false,
         },
     );
     client.set_amendment_ttl(&company, &100);
@@ -11550,4 +11581,1080 @@ fn test_batch_raise_dispute_reason_too_long_panics() {
         &vec![&env, 0u32],
         &String::from_str(&env, &long),
     );
+}
+
+// ============================================================
+// ISSUE #458 — RECRUITER PAYOUT TOKEN & SWAP ADAPTER (#626)
+// ============================================================
+
+/// Reusable mock of the [`SwapAdapter`] interface. Pays out `to_token` from
+/// its own pre-funded balance at a fixed rate (`amount_in * num / den`, 1:1
+/// until `set_rate` is called) and counts calls so tests can tell a swapped
+/// payout from a direct one. Fund it with [`setup_swap_adapter`].
+#[contract]
+struct MockSwapAdapter;
+
+#[contractimpl]
+impl MockSwapAdapter {
+    pub fn set_rate(env: Env, num: i128, den: i128) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "rate"), &(num, den));
+    }
+
+    pub fn swap_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "count"))
+            .unwrap_or(0)
+    }
+
+    pub fn swap(
+        env: Env,
+        _from_token: Address,
+        to_token: Address,
+        amount_in: i128,
+        recipient: Address,
+    ) -> i128 {
+        let (num, den): (i128, i128) = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "rate"))
+            .unwrap_or((1, 1));
+        let amount_out = amount_in * num / den;
+        token::Client::new(&env, &to_token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount_out,
+        );
+        let count = Self::swap_count(env.clone()) + 1;
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "count"), &count);
+        amount_out
+    }
+}
+
+/// Register a [`MockSwapAdapter`] and a second Stellar asset to swap into,
+/// minting the adapter enough of that asset to cover any payout in this
+/// suite. Returns `(adapter, payout_token)`.
+fn setup_swap_adapter(env: &Env) -> (Address, Address) {
+    let adapter = env.register(MockSwapAdapter, ());
+    let payout_token = env
+        .register_stellar_asset_contract_v2(Address::generate(env))
+        .address();
+    token::StellarAssetClient::new(env, &payout_token).mint(&adapter, &100_000_000_000);
+    (adapter, payout_token)
+}
+
+/// Submit and confirm milestone 0 (30 % of the standard 1B engagement).
+fn confirm_first_milestone(
+    env: &Env,
+    client: &HireSettleContractClient,
+    company: &Address,
+    recruiter: &Address,
+    eng_id: &String,
+) {
+    client.submit_proof(recruiter, eng_id, &0, &String::from_str(env, "ipfs://placed"));
+    client.confirm_milestone(company, eng_id, &0);
+}
+
+#[test]
+fn test_recruiter_payout_token_set_get_clear() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (_adapter, payout_token) = setup_swap_adapter(&env);
+
+    assert_eq!(client.get_recruiter_payout_token(&recruiter), None);
+    client.set_recruiter_payout_token(&recruiter, &payout_token);
+    assert!(has_event(&env, "payout_token_set"));
+    assert_eq!(client.get_recruiter_payout_token(&recruiter), Some(payout_token));
+
+    client.clear_recruiter_payout_token(&recruiter);
+    assert!(has_event(&env, "payout_token_cleared"));
+    assert_eq!(client.get_recruiter_payout_token(&recruiter), None);
+}
+
+#[test]
+fn test_swap_adapter_set_get_clear() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (adapter, _payout_token) = setup_swap_adapter(&env);
+
+    assert_eq!(client.get_swap_adapter(), None);
+    client.set_swap_adapter(&company, &adapter);
+    assert!(has_event(&env, "swap_adapter_set"));
+    assert_eq!(client.get_swap_adapter(), Some(adapter));
+
+    client.clear_swap_adapter(&company);
+    assert!(has_event(&env, "swap_adapter_cleared"));
+    assert_eq!(client.get_swap_adapter(), None);
+}
+
+#[test]
+fn test_payout_swapped_when_preference_and_adapter_set() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (adapter, payout_token) = setup_swap_adapter(&env);
+    let adapter_client = MockSwapAdapterClient::new(&env, &adapter);
+    adapter_client.set_rate(&2, &1);
+
+    client.set_swap_adapter(&company, &adapter);
+    client.set_recruiter_payout_token(&recruiter, &payout_token);
+
+    let eng_id = String::from_str(&env, "ENG-SWAP");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-SWAP",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+    assert!(has_event(&env, "payout_swapped"));
+
+    // The 300M escrow share went to the adapter and came back as 600M of the
+    // preferred token; none of the escrow token reached the recruiter.
+    assert_eq!(adapter_client.swap_count(), 1);
+    assert_eq!(token_client.balance(&recruiter), 0);
+    assert_eq!(token_client.balance(&adapter), 300_000_000);
+    assert_eq!(
+        token::Client::new(&env, &payout_token).balance(&recruiter),
+        600_000_000
+    );
+    assert_eq!(token_client.balance(&contract_id), 700_000_000);
+}
+
+#[test]
+fn test_payout_swap_applies_to_net_after_platform_fee() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let treasury = Address::generate(&env);
+    let (adapter, payout_token) = setup_swap_adapter(&env);
+
+    client.set_platform_fee(&company, &250, &treasury);
+    client.set_swap_adapter(&company, &adapter);
+    client.set_recruiter_payout_token(&recruiter, &payout_token);
+
+    let eng_id = String::from_str(&env, "ENG-SWAP-FEE");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-SWAP-FEE",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+
+    // Fee stays in the escrow token; only the 292.5M net is swapped (1:1).
+    assert_eq!(token_client.balance(&treasury), 7_500_000);
+    assert_eq!(token_client.balance(&adapter), 292_500_000);
+    assert_eq!(
+        token::Client::new(&env, &payout_token).balance(&recruiter),
+        292_500_000
+    );
+}
+
+#[test]
+fn test_payout_direct_when_preference_set_without_adapter() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (_adapter, payout_token) = setup_swap_adapter(&env);
+
+    client.set_recruiter_payout_token(&recruiter, &payout_token);
+
+    let eng_id = String::from_str(&env, "ENG-NO-ADAPTER");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-NO-ADAPTER",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+    assert!(!has_event(&env, "payout_swapped"));
+
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+    assert_eq!(token::Client::new(&env, &payout_token).balance(&recruiter), 0);
+}
+
+#[test]
+fn test_payout_direct_when_adapter_set_without_preference() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (adapter, _payout_token) = setup_swap_adapter(&env);
+
+    client.set_swap_adapter(&company, &adapter);
+
+    let eng_id = String::from_str(&env, "ENG-NO-PREF");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-NO-PREF",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+    assert_eq!(MockSwapAdapterClient::new(&env, &adapter).swap_count(), 0);
+}
+
+#[test]
+fn test_payout_direct_when_preference_is_escrow_token() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (adapter, _payout_token) = setup_swap_adapter(&env);
+
+    client.set_swap_adapter(&company, &adapter);
+    client.set_recruiter_payout_token(&recruiter, &token_id);
+
+    let eng_id = String::from_str(&env, "ENG-SAME-TOKEN");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-SAME-TOKEN",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+    assert_eq!(MockSwapAdapterClient::new(&env, &adapter).swap_count(), 0);
+}
+
+#[test]
+fn test_clearing_swap_adapter_reverts_to_direct_payout() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (adapter, payout_token) = setup_swap_adapter(&env);
+    let adapter_client = MockSwapAdapterClient::new(&env, &adapter);
+
+    client.set_swap_adapter(&company, &adapter);
+    client.set_recruiter_payout_token(&recruiter, &payout_token);
+
+    let eng_id = String::from_str(&env, "ENG-CLR-ADAPTER");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CLR-ADAPTER",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+    assert_eq!(adapter_client.swap_count(), 1);
+
+    client.clear_swap_adapter(&company);
+
+    // Milestone 1 (40 %) unlocks after its 30-day retention window.
+    advance_ledger(&env, 30 * 17_280 + 1);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30d"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    assert_eq!(adapter_client.swap_count(), 1);
+    assert_eq!(token_client.balance(&recruiter), 400_000_000);
+    assert_eq!(
+        token::Client::new(&env, &payout_token).balance(&recruiter),
+        300_000_000
+    );
+}
+
+#[test]
+fn test_clearing_payout_preference_reverts_to_direct_payout() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (adapter, payout_token) = setup_swap_adapter(&env);
+    let adapter_client = MockSwapAdapterClient::new(&env, &adapter);
+
+    client.set_swap_adapter(&company, &adapter);
+    client.set_recruiter_payout_token(&recruiter, &payout_token);
+
+    let eng_id = String::from_str(&env, "ENG-CLR-PREF");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CLR-PREF",
+    );
+    confirm_first_milestone(&env, &client, &company, &recruiter, &eng_id);
+    assert_eq!(adapter_client.swap_count(), 1);
+
+    client.clear_recruiter_payout_token(&recruiter);
+
+    // Milestone 1 (40 %) unlocks after its 30-day retention window.
+    advance_ledger(&env, 30 * 17_280 + 1);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30d"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    assert_eq!(adapter_client.swap_count(), 1);
+    assert_eq!(token_client.balance(&recruiter), 400_000_000);
+    assert_eq!(
+        token::Client::new(&env, &payout_token).balance(&recruiter),
+        300_000_000
+    );
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_set_swap_adapter() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (adapter, _payout_token) = setup_swap_adapter(&env);
+    client.set_swap_adapter(&recruiter, &adapter);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_clear_swap_adapter() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (adapter, _payout_token) = setup_swap_adapter(&env);
+    client.set_swap_adapter(&company, &adapter);
+    client.clear_swap_adapter(&recruiter);
+}
+
+// ============================================================
+// ISSUE #482 — RECRUITER ACTIVE-ENGAGEMENT CAPS (#625)
+// ============================================================
+
+#[test]
+fn test_recruiter_active_cap_set_get_and_remove() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_recruiter_active_cap(&recruiter), None);
+    client.set_recruiter_active_cap(&recruiter, &2);
+    assert!(has_event(&env, "recruiter_active_cap_set"));
+    assert_eq!(client.get_recruiter_active_cap(&recruiter), Some(2));
+
+    client.set_recruiter_active_cap(&recruiter, &0);
+    assert_eq!(client.get_recruiter_active_cap(&recruiter), None);
+}
+
+#[test]
+fn test_max_active_per_recruiter_set_get() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_max_active_per_recruiter(), 0);
+    client.set_max_active_per_recruiter(&company, &3);
+    assert!(has_event(&env, "max_active_per_recruiter_set"));
+    assert_eq!(client.get_max_active_per_recruiter(), 3);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_set_max_active_per_recruiter() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_active_per_recruiter(&recruiter, &3);
+}
+
+#[test]
+#[should_panic(expected = "RecruiterActiveLimitReached")]
+fn test_recruiter_self_cap_blocks_create_when_reached() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_recruiter_active_cap(&recruiter, &2);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "CAP-1");
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "CAP-2");
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "CAP-3");
+}
+
+#[test]
+fn test_recruiter_self_cap_allows_up_to_cap_and_ignores_other_recruiters() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let other = Address::generate(&env);
+    client.set_recruiter_active_cap(&recruiter, &1);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "CAP-A");
+    // Another recruiter's slots are counted separately.
+    create_engagement_with_id(&env, &client, &token_id, &company, &other, &arbiter, "CAP-B");
+    create_engagement_with_id(&env, &client, &token_id, &company, &other, &arbiter, "CAP-C");
+
+    let res = client.try_create_engagement(
+        &String::from_str(&env, "CAP-D"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+            weights: None,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+#[should_panic(expected = "RecruiterActiveLimitReached")]
+fn test_admin_recruiter_cap_blocks_independently() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_active_per_recruiter(&company, &1);
+    assert_eq!(client.get_recruiter_active_cap(&recruiter), None);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ADM-1");
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ADM-2");
+}
+
+#[test]
+#[should_panic(expected = "RecruiterActiveLimitReached")]
+fn test_stricter_self_cap_wins_over_admin_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_active_per_recruiter(&company, &5);
+    client.set_recruiter_active_cap(&recruiter, &1);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "STR-1");
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "STR-2");
+}
+
+#[test]
+#[should_panic(expected = "RecruiterActiveLimitReached")]
+fn test_stricter_admin_cap_wins_over_self_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_active_per_recruiter(&company, &1);
+    client.set_recruiter_active_cap(&recruiter, &5);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "STA-1");
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "STA-2");
+}
+
+#[test]
+fn test_cancelling_engagement_frees_recruiter_slot() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_recruiter_active_cap(&recruiter, &1);
+    client.set_max_active_per_recruiter(&company, &1);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "FREE-1");
+    client.cancel_engagement(&company, &recruiter, &String::from_str(&env, "FREE-1"));
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "FREE-2");
+    assert_eq!(
+        client.get_engagement(&String::from_str(&env, "FREE-2")).status,
+        EngagementStatus::Active
+    );
+}
+
+#[test]
+fn test_completing_engagement_frees_recruiter_slot() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_recruiter_active_cap(&recruiter, &1);
+    client.set_max_active_per_recruiter(&company, &1);
+
+    let first = String::from_str(&env, "DONE-1");
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "DONE-1", default_config(),
+    );
+    client.submit_proof(&recruiter, &first, &0, &String::from_str(&env, "ipfs://done"));
+    client.confirm_milestone(&company, &first, &0);
+    assert_eq!(client.get_engagement(&first).status, EngagementStatus::Completed);
+
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "DONE-2");
+    assert_eq!(
+        client.get_engagement(&String::from_str(&env, "DONE-2")).status,
+        EngagementStatus::Active
+    );
+}
+
+#[test]
+fn test_recruiter_active_cap_requires_recruiter_auth() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_recruiter_active_cap(&recruiter, &3);
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, recruiter);
+}
+
+#[test]
+fn test_third_party_cannot_set_recruiter_active_cap() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let intruder = Address::generate(&env);
+
+    // Only the intruder signs; the cap is keyed by `recruiter`, whose auth is missing.
+    env.mock_auths(&[MockAuth {
+        address: &intruder,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_recruiter_active_cap",
+            args: (recruiter.clone(), 1u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_set_recruiter_active_cap(&recruiter, &1).is_err());
+    assert_eq!(client.get_recruiter_active_cap(&recruiter), None);
+}
+
+// ============================================================
+// ISSUE #462 — SPLIT (PARTIAL-APPROVAL) DISPUTE VOTING (#621)
+// ============================================================
+
+/// Single 100 % Placement milestone with the given panel, so one split
+/// resolution completes the engagement and refunds the withheld remainder.
+fn create_split_vote_engagement(
+    env: &Env,
+    client: &HireSettleContractClient,
+    token_id: &Address,
+    company: &Address,
+    recruiter: &Address,
+    arbiter_setup: ArbiterSetup,
+    id: &str,
+) -> String {
+    let eng_id = String::from_str(env, id);
+    client.create_engagement(
+        &eng_id,
+        company,
+        recruiter,
+        &arbiter_setup,
+        token_id,
+        &1_000_000_000,
+        &String::from_str(env, "Split"),
+        &vec![
+            env,
+            Milestone {
+                name: String::from_str(env, "Placed"),
+                payment_percent: 100,
+                kind: MilestoneKind::Placement,
+                valid_after_ledger: 0,
+                proof_hash: String::from_str(env, ""),
+                status: MilestoneStatus::Pending,
+                proof_submitted_at: 0,
+                replacement_paid_out: 0,
+                prerequisites: Vec::new(env),
+            },
+        ],
+        &Vec::new(env),
+        &default_config(),
+    );
+    eng_id
+}
+
+fn submit_and_dispute(
+    env: &Env,
+    client: &HireSettleContractClient,
+    company: &Address,
+    recruiter: &Address,
+    eng_id: &String,
+) {
+    client.submit_proof(recruiter, eng_id, &0, &String::from_str(env, "ipfs://contested"));
+    client.raise_dispute(company, eng_id, &0, &String::from_str(env, "partial"));
+}
+
+fn single_arbiter(env: &Env, arbiter: &Address) -> ArbiterSetup {
+    ArbiterSetup {
+        arbiters: vec![env, arbiter.clone()],
+        quorum: 1,
+        weights: None,
+    }
+}
+
+const COMPANY_START_BALANCE: i128 = 500_000_000_000;
+
+#[test]
+fn test_split_voting_disabled_by_default_and_toggle() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-TOG",
+    );
+
+    assert!(!client.is_split_voting_enabled(&eng_id));
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    assert!(has_event(&env, "split_voting_set"));
+    assert!(client.is_split_voting_enabled(&eng_id));
+    client.set_split_voting_enabled(&company, &eng_id, &false);
+    assert!(!client.is_split_voting_enabled(&eng_id));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_enable_split_voting() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-NA",
+    );
+    client.set_split_voting_enabled(&recruiter, &eng_id, &true);
+}
+
+#[test]
+#[should_panic(expected = "SplitVotingDisabled")]
+fn test_split_vote_rejected_when_disabled() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-OFF",
+    );
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &50);
+}
+
+#[test]
+#[should_panic(expected = "SplitVotingDisabled")]
+fn test_split_vote_rejected_after_disabling() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-OFF2",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    client.set_split_voting_enabled(&company, &eng_id, &false);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &50);
+}
+
+#[test]
+#[should_panic(expected = "InvalidSplitPercent")]
+fn test_split_percent_over_100_panics() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-101",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &101);
+}
+
+#[test]
+fn test_split_percent_boundaries_0_and_100_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let full = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-100",
+    );
+    client.set_split_voting_enabled(&company, &full, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &full);
+    client.cast_arbiter_split_vote(&arbiter, &full, &0, &100);
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+
+    let none = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-0",
+    );
+    client.set_split_voting_enabled(&company, &none, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &none);
+    client.cast_arbiter_split_vote(&arbiter, &none, &0, &0);
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+    assert_eq!(token_client.balance(&company), COMPANY_START_BALANCE - 1_000_000_000);
+    assert_eq!(client.get_milestone(&none, &0).status, MilestoneStatus::Resolved);
+}
+
+#[test]
+fn test_split_vote_resolves_at_quorum_with_exact_amounts() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+
+    let eng_id = create_split_vote_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone(), second.clone(), third.clone()],
+            quorum: 2,
+            weights: None,
+        },
+        "SPL-Q",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+
+    // Below quorum: the vote is recorded, nothing moves.
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &70);
+    assert!(has_event(&env, "arbiter_split_voted"));
+    assert_eq!(client.get_dispute_split_votes(&eng_id, &0), vec![&env, 70u32]);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Disputed);
+    assert_eq!(token_client.balance(&recruiter), 0);
+    assert_eq!(token_client.balance(&contract_id), 1_000_000_000);
+
+    // Quorum reached: lower median of [70, 40] is 40.
+    client.cast_arbiter_split_vote(&second, &eng_id, &0, &40);
+    assert!(has_event(&env, "dispute_split_resolved"));
+    assert_eq!(token_client.balance(&recruiter), 400_000_000);
+    assert_eq!(
+        token_client.balance(&company),
+        COMPANY_START_BALANCE - 1_000_000_000 + 600_000_000
+    );
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Resolved);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+    assert_eq!(client.get_dispute_split_votes(&eng_id, &0), Vec::<u32>::new(&env));
+}
+
+#[test]
+fn test_split_vote_withheld_remainder_stays_in_escrow_until_completion() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let eng_id = String::from_str(&env, "SPL-ESC");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "SPL-ESC",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &33);
+
+    // Milestone 0 share is 300M: 99M released, 201M withheld in escrow.
+    assert_eq!(token_client.balance(&recruiter), 99_000_000);
+    assert_eq!(token_client.balance(&contract_id), 901_000_000);
+    assert_eq!(token_client.balance(&company), COMPANY_START_BALANCE - 1_000_000_000);
+    assert_eq!(client.get_engagement(&eng_id).released_amount, 99_000_000);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "duplicate vote")]
+fn test_split_vote_duplicate_panics() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let (eng_id, _second) =
+        two_arbiter_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, 2);
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &60);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &60);
+}
+
+#[test]
+fn test_split_vote_weighted_panel_counts_each_vote_with_its_weight() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let light = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    let eng_id = create_split_vote_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone(), light.clone(), other.clone()],
+            quorum: 3,
+            weights: Some(vec![&env, 2u32, 1u32, 1u32]),
+        },
+        "SPL-W",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+
+    // Weight 1 of the 3 needed.
+    client.cast_arbiter_split_vote(&light, &eng_id, &0, &20);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Disputed);
+
+    // Weight 2 brings the total to 3. Unweighted, the lower median of
+    // [20, 80] would be 20; weighted, 80 carries 2 of 3 and wins.
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &80);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 800_000_000);
+    assert_eq!(
+        token_client.balance(&company),
+        COMPANY_START_BALANCE - 1_000_000_000 + 200_000_000
+    );
+}
+
+#[test]
+fn test_split_vote_heavy_arbiter_alone_meets_weighted_quorum() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let light = Address::generate(&env);
+
+    let eng_id = create_split_vote_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone(), light.clone()],
+            quorum: 2,
+            weights: Some(vec![&env, 2u32, 1u32]),
+        },
+        "SPL-HEAVY",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &55);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 550_000_000);
+    assert_eq!(
+        token_client.balance(&company),
+        COMPANY_START_BALANCE - 1_000_000_000 + 450_000_000
+    );
+}
+
+#[test]
+fn test_split_vote_fees_apply_to_recruiter_share_only() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let treasury = Address::generate(&env);
+
+    client.set_platform_fee(&company, &250, &treasury);
+    client.set_arbiter_fee(&company, &100);
+
+    let eng_id = create_split_vote_engagement(
+        &env, &client, &token_id, &company, &recruiter, single_arbiter(&env, &arbiter), "SPL-FEE",
+    );
+    client.set_split_voting_enabled(&company, &eng_id, &true);
+    submit_and_dispute(&env, &client, &company, &recruiter, &eng_id);
+    client.cast_arbiter_split_vote(&arbiter, &eng_id, &0, &33);
+
+    // Released 330M: platform fee 2.5 % = 8_250_000, arbiter fee 1 % of the
+    // 321_750_000 remainder = 3_217_500, recruiter nets 318_532_500. The
+    // 670M withheld is refunded to the company untouched by either fee.
+    assert_eq!(token_client.balance(&treasury), 8_250_000);
+    assert_eq!(token_client.balance(&arbiter), 3_217_500);
+    assert_eq!(token_client.balance(&recruiter), 318_532_500);
+    assert_eq!(
+        token_client.balance(&company),
+        COMPANY_START_BALANCE - 1_000_000_000 + 670_000_000
+    );
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+// ============================================================
+// ISSUE #469 — PER-ENGAGEMENT DISPUTE WINDOW OVERRIDE (#620)
+// ============================================================
+
+#[test]
+fn test_dispute_window_company_proposes_recruiter_accepts() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-1");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-1");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    assert!(has_event(&env, "dispute_window_proposed"));
+    let proposal = client.get_dispute_window_proposal(&eng_id).unwrap();
+    assert_eq!(proposal.proposer, company);
+    assert!(proposal.proposed_by_company);
+    assert_eq!(proposal.ledgers, 1_000);
+    assert_eq!(
+        proposal.expires_at_ledger,
+        env.ledger().sequence() + DISPUTE_WINDOW_PROPOSAL_TTL_LEDGERS
+    );
+    // Not in effect until accepted.
+    assert_eq!(client.get_engagement_dispute_window(&eng_id), DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+    assert!(has_event(&env, "dispute_window_accepted"));
+    assert_eq!(client.get_dispute_window_proposal(&eng_id), None);
+    assert_eq!(client.get_engagement_dispute_window(&eng_id), 1_000);
+}
+
+#[test]
+fn test_dispute_window_recruiter_proposes_company_accepts() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-2");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-2");
+
+    client.propose_dispute_window_override(&recruiter, &eng_id, &80_000);
+    let proposal = client.get_dispute_window_proposal(&eng_id).unwrap();
+    assert_eq!(proposal.proposer, recruiter);
+    assert!(!proposal.proposed_by_company);
+
+    client.accept_dispute_window_override(&company, &eng_id);
+    assert_eq!(client.get_engagement_dispute_window(&eng_id), 80_000);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_dispute_window_company_cannot_accept_own_proposal() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-SELF-C");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-SELF-C");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    client.accept_dispute_window_override(&company, &eng_id);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_dispute_window_recruiter_cannot_accept_own_proposal() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-SELF-R");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-SELF-R");
+
+    client.propose_dispute_window_override(&recruiter, &eng_id, &1_000);
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_dispute_window_third_party_cannot_propose() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-3P");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-3P");
+
+    client.propose_dispute_window_override(&Address::generate(&env), &eng_id, &1_000);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_dispute_window_third_party_cannot_accept() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-3A");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-3A");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    client.accept_dispute_window_override(&arbiter, &eng_id);
+}
+
+#[test]
+#[should_panic(expected = "InvalidDisputeWindow")]
+fn test_dispute_window_zero_ledgers_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-ZERO");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-ZERO");
+
+    client.propose_dispute_window_override(&company, &eng_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "DisputeWindowProposalPending")]
+fn test_dispute_window_second_proposal_while_pending_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-PEND");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-PEND");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    client.propose_dispute_window_override(&recruiter, &eng_id, &2_000);
+}
+
+#[test]
+fn test_dispute_window_accept_on_last_ledger_of_ttl_succeeds() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-EDGE");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-EDGE");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    advance_ledger(&env, DISPUTE_WINDOW_PROPOSAL_TTL_LEDGERS);
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+    assert_eq!(client.get_engagement_dispute_window(&eng_id), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "NoPendingDisputeWindowProposal")]
+fn test_dispute_window_accept_after_ttl_panics() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-TTL");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-TTL");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    advance_ledger(&env, DISPUTE_WINDOW_PROPOSAL_TTL_LEDGERS + 1);
+    assert_eq!(client.get_dispute_window_proposal(&eng_id), None);
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+}
+
+#[test]
+fn test_dispute_window_rejection_clears_proposal() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-REJ");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-REJ");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    client.reject_dispute_window_override(&recruiter, &eng_id);
+    assert!(has_event(&env, "dispute_window_rejected"));
+    assert_eq!(client.get_dispute_window_proposal(&eng_id), None);
+    assert_eq!(client.get_engagement_dispute_window(&eng_id), DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+    // A fresh proposal can follow the rejection.
+    client.propose_dispute_window_override(&recruiter, &eng_id, &2_000);
+    assert_eq!(client.get_dispute_window_proposal(&eng_id).unwrap().ledgers, 2_000);
+}
+
+#[test]
+#[should_panic(expected = "NoPendingDisputeWindowProposal")]
+fn test_dispute_window_accept_after_rejection_panics() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-REJ2");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-REJ2");
+
+    client.propose_dispute_window_override(&company, &eng_id, &1_000);
+    client.reject_dispute_window_override(&recruiter, &eng_id);
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+}
+
+#[test]
+fn test_engagement_dispute_window_tracks_global_without_override() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let plain = String::from_str(&env, "DW-PLAIN");
+    let custom = String::from_str(&env, "DW-CUSTOM");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-PLAIN");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-CUSTOM");
+
+    client.propose_dispute_window_override(&company, &custom, &1_000);
+    client.accept_dispute_window_override(&recruiter, &custom);
+
+    client.set_dispute_window(&company, &5_000);
+    assert_eq!(client.get_engagement_dispute_window(&plain), 5_000);
+    assert_eq!(client.get_engagement_dispute_window(&custom), 1_000);
+}
+
+#[test]
+fn test_raise_dispute_allowed_on_overridden_window_boundary() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-BOUND");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-BOUND");
+
+    client.propose_dispute_window_override(&company, &eng_id, &100);
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    advance_ledger(&env, 100);
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "late"));
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Disputed);
+}
+
+#[test]
+#[should_panic(expected = "DisputeWindowClosed")]
+fn test_raise_dispute_rejected_past_shortened_window() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-SHORT");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-SHORT");
+
+    client.propose_dispute_window_override(&company, &eng_id, &100);
+    client.accept_dispute_window_override(&recruiter, &eng_id);
+
+    // Well inside the 51_840-ledger global window, but past the override.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    advance_ledger(&env, 101);
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "late"));
+}
+
+#[test]
+fn test_raise_dispute_allowed_past_global_within_extended_window() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "DW-LONG");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "DW-LONG");
+
+    client.propose_dispute_window_override(&recruiter, &eng_id, &60_000);
+    client.accept_dispute_window_override(&company, &eng_id);
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    advance_ledger(&env, DEFAULT_DISPUTE_WINDOW_LEDGERS + 1);
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "late"));
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Disputed);
 }

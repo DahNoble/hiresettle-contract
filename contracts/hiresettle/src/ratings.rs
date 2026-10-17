@@ -63,6 +63,28 @@ impl HireSettleContract {
             .persistent()
             .extend_ttl(&rating_key, 100_000, 6_300_000);
 
+        // ISSUE #596 — recency-weighted rating. Decay the running weighted
+        // totals by the configured half-life (in ledgers) before folding in
+        // the new rating, so older ratings contribute exponentially less.
+        let weighted_key = DataKey2::RecruiterWeightedRating(engagement.recruiter.clone());
+        let mut weighted: WeightedRatingSummary = env
+            .storage()
+            .persistent()
+            .get(&weighted_key)
+            .unwrap_or(WeightedRatingSummary {
+                weighted_stars: 0,
+                weighted_count: 0,
+                last_ledger: env.ledger().sequence(),
+            });
+        Self::decay_weighted_rating(&env, &mut weighted);
+        weighted.weighted_stars += (stars as u64) * WEIGHTED_RATING_SCALE;
+        weighted.weighted_count += WEIGHTED_RATING_SCALE;
+        weighted.last_ledger = env.ledger().sequence();
+        env.storage().persistent().set(&weighted_key, &weighted);
+        env.storage()
+            .persistent()
+            .extend_ttl(&weighted_key, 100_000, 6_300_000);
+
         env.events().publish(
             (Symbol::new(&env, "recruiter_rated"), engagement_id),
             (engagement.recruiter, stars),
@@ -78,119 +100,95 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
-    // ISSUE #567 — ARBITER RATINGS BY PARTIES
+    // ISSUE #596 — RECENCY-WEIGHTED RECRUITER RATING
     // ----------------------------------------------------------
 
-    /// A party (company or recruiter) rates an arbiter who voted on a resolved
-    /// dispute for the given engagement/milestone. Each party may rate each
-    /// arbiter at most once per dispute; the rating is added to the arbiter's
-    /// running `RatingSummary`.
-    ///
-    /// # Panics
-    /// - `"ContractPaused"` — the contract is paused.
-    /// - `"InvalidRating"` — `stars` is outside 1–5.
-    /// - `"unauthorized"` — caller is not a party to the engagement.
-    /// - `"DisputeNotResolved"` — the dispute has not been resolved.
-    /// - `"ArbiterDidNotVote"` — `arbiter` did not vote on this dispute.
-    /// - `"AlreadyRated"` — this party already rated this arbiter for this dispute.
-    ///
-    /// # Events
-    /// Emits `("arbiter_rated", engagement_id)` with `(arbiter, rater, stars)`.
-    pub fn rate_arbiter(
-        env: Env,
-        rater: Address,
-        engagement_id: String,
-        milestone_index: u32,
-        arbiter: Address,
-        stars: u32,
-    ) {
-        Self::assert_not_paused(&env);
-        rater.require_auth();
-
-        if !(MIN_RATING_STARS..=MAX_RATING_STARS).contains(&stars) {
-            panic!("InvalidRating");
-        }
-
-        let engagement = Self::get_engagement_internal(&env, &engagement_id);
-
-        if !Self::is_authorized_company(&env, &rater, &engagement.company)
-            && rater != engagement.recruiter
-        {
-            panic!("{}", ERR_UNAUTHORIZED);
-        }
-
-        let dispute = Self::get_dispute_internal(&env, &engagement_id, milestone_index);
-        if dispute.status != DisputeStatus::Resolved {
-            panic!("DisputeNotResolved");
-        }
-
-        if !Self::arbiter_voted_on_dispute(&env, &engagement_id, milestone_index, &arbiter) {
-            panic!("ArbiterDidNotVote");
-        }
-
-        let rated_key = DataKey2::ArbiterRated(
-            engagement_id.clone(),
-            milestone_index,
-            rater.clone(),
-            arbiter.clone(),
-        );
-        if env.storage().persistent().has(&rated_key) {
-            panic!("AlreadyRated");
-        }
-        env.storage().persistent().set(&rated_key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&rated_key, 100_000, 6_300_000);
-
-        let rating_key = DataKey2::ArbiterRating(arbiter.clone());
-        let mut summary: RatingSummary =
-            env.storage()
-                .persistent()
-                .get(&rating_key)
-                .unwrap_or(RatingSummary {
-                    total_stars: 0,
-                    rating_count: 0,
-                });
-        summary.total_stars += stars as u64;
-        summary.rating_count += 1;
-        env.storage().persistent().set(&rating_key, &summary);
-        env.storage()
-            .persistent()
-            .extend_ttl(&rating_key, 100_000, 6_300_000);
-
-        env.events().publish(
-            (Symbol::new(&env, "arbiter_rated"), engagement_id),
-            (arbiter, rater, stars),
-        );
-    }
-
-    /// Return the arbiter's accumulated rating, or `None` if they have never
-    /// been rated.
-    pub fn get_arbiter_rating(env: Env, arbiter: Address) -> Option<RatingSummary> {
-        env.storage()
-            .persistent()
-            .get(&DataKey2::ArbiterRating(arbiter))
-    }
-
-    /// Admin toggles whether arbiter ratings are blended into the arbiter
-    /// selection weight. Disabled by default.
-    pub fn set_arbiter_rating_weight_enabled(env: Env, admin: Address, enabled: bool) {
+    /// Admin configures the half-life (in ledgers) used to exponentially decay
+    /// a recruiter's weighted rating. A half-life of 0 disables decay (the
+    /// weighted rating then tracks the lifetime average).
+    pub fn set_weighted_rating_half_life(env: Env, admin: Address, half_life_ledgers: u32) {
         Self::assert_admin(&env, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::ArbiterRatingWeight), &enabled);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::WeightedRatingHalfLife),
+            &half_life_ledgers,
+        );
         env.events().publish(
-            (Symbol::new(&env, "arbiter_rating_weight_set"),),
-            enabled,
+            (Symbol::new(&env, "weighted_hl_set"),),
+            half_life_ledgers,
         );
     }
 
-    /// Return whether arbiter ratings are blended into selection weight.
-    pub fn get_arbiter_rating_weight_enabled(env: Env) -> bool {
+    /// Return the configured weighted-rating half-life in ledgers (0 if unset).
+    pub fn get_weighted_rating_half_life(env: Env) -> u32 {
+        Self::get_weighted_rating_half_life_internal(&env)
+    }
+
+    /// Return the recruiter's recency-weighted rating as stars × 100, or `None`
+    /// if they have never been rated. The stored weighted totals are decayed to
+    /// the current ledger before the average is computed.
+    pub fn get_recruiter_recent_rating(env: Env, recruiter: Address) -> Option<u32> {
+        let key = DataKey2::RecruiterWeightedRating(recruiter);
+        let mut weighted: WeightedRatingSummary = env.storage().persistent().get(&key)?;
+        if weighted.weighted_count == 0 {
+            return None;
+        }
+        Self::decay_weighted_rating(&env, &mut weighted);
+        let stars_x100 = weighted
+            .weighted_stars
+            .saturating_mul(100)
+            / weighted.weighted_count;
+        Some(stars_x100 as u32)
+    }
+
+    pub(crate) fn get_weighted_rating_half_life_internal(env: &Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::Config(ConfigKey::ArbiterRatingWeight))
-            .unwrap_or(false)
+            .get(&DataKey::Config(ConfigKey::WeightedRatingHalfLife))
+            .unwrap_or(0)
+    }
+
+    /// Apply exponential decay to `weighted` for the ledgers elapsed since its
+    /// `last_ledger`, using the configured half-life. Decay is applied in
+    /// `WEIGHTED_RATING_SCALE` fixed-point units; a zero half-life is a no-op.
+    pub(crate) fn decay_weighted_rating(env: &Env, weighted: &mut WeightedRatingSummary) {
+        let half_life = Self::get_weighted_rating_half_life_internal(env);
+        let now = env.ledger().sequence();
+        if half_life == 0 || now <= weighted.last_ledger {
+            weighted.last_ledger = now;
+            return;
+        }
+        let elapsed = (now - weighted.last_ledger) as u64;
+        let factor = Self::decay_factor(elapsed, half_life as u64);
+        weighted.weighted_stars = weighted.weighted_stars.saturating_mul(factor) / WEIGHTED_RATING_SCALE;
+        weighted.weighted_count = weighted.weighted_count.saturating_mul(factor) / WEIGHTED_RATING_SCALE;
+        weighted.last_ledger = now;
+    }
+
+    /// Deterministic fixed-point decay factor for `elapsed` ledgers given a
+    /// `half_life`, expressed in `WEIGHTED_RATING_SCALE` units. Computed as
+    /// `SCALE * (1/2)^(elapsed/half_life)` using integer halving steps so the
+    /// result is fully deterministic across platforms.
+    pub(crate) fn decay_factor(elapsed: u64, half_life: u64) -> u64 {
+        if half_life == 0 {
+            return WEIGHTED_RATING_SCALE;
+        }
+        let mut factor = WEIGHTED_RATING_SCALE;
+        let mut remaining = elapsed;
+        while remaining >= half_life {
+            factor /= 2;
+            remaining -= half_life;
+            if factor == 0 {
+                return 0;
+            }
+        }
+        // Linear interpolation for the sub-half-life remainder keeps the curve
+        // smooth while staying integer-deterministic.
+        if remaining > 0 {
+            let step = WEIGHTED_RATING_SCALE / 2;
+            let drop = step.saturating_mul(remaining) / half_life;
+            factor = factor.saturating_sub(drop);
+        }
+        factor
     }
 
     // ----------------------------------------------------------
@@ -229,6 +227,26 @@ impl HireSettleContract {
         Self::get_proof_cooldown_discount_internal(&env)
     }
 
+    /// Admin selects whether the proof cooldown discount uses the recruiter's
+    /// lifetime rating (`false`, the default) or their recency-weighted rating
+    /// (`true`).
+    pub fn set_cooldown_uses_recent_rating(env: Env, admin: Address, use_recent: bool) {
+        Self::assert_admin(&env, &admin);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::CooldownUsesRecentRating),
+            &use_recent,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "cooldown_recent_set"),),
+            use_recent,
+        );
+    }
+
+    /// Return whether the cooldown discount uses the recency-weighted rating.
+    pub fn get_cooldown_uses_recent_rating(env: Env) -> bool {
+        Self::cooldown_uses_recent_rating_internal(&env)
+    }
+
     /// Return the proof resubmission cooldown that applies to `recruiter`:
     /// `max(min_cooldown_ledgers, base_cooldown - average_stars * discount_per_star_ledgers)`,
     /// using the recruiter's rating at read time.
@@ -251,6 +269,13 @@ impl HireSettleContract {
             })
     }
 
+    pub(crate) fn cooldown_uses_recent_rating_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::CooldownUsesRecentRating))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn effective_proof_cooldown_internal(env: &Env, recruiter: &Address) -> u32 {
         let base = Self::get_proof_cooldown(env);
         let config = Self::get_proof_cooldown_discount_internal(env);
@@ -258,19 +283,28 @@ impl HireSettleContract {
             return base;
         }
 
-        let summary: Option<RatingSummary> = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::RecruiterRating(recruiter.clone()));
-        let summary = match summary {
-            Some(s) if s.rating_count > 0 => s,
-            _ => return base,
+        // ISSUE #596 — the admin flag selects lifetime vs recency-weighted
+        // rating for the discount. Both are expressed as stars × 100 so the
+        // fractional discount maths is shared.
+        let stars_x100: u64 = if Self::cooldown_uses_recent_rating_internal(env) {
+            match Self::get_recruiter_recent_rating(env.clone(), recruiter.clone()) {
+                Some(v) => v as u64,
+                None => return base,
+            }
+        } else {
+            let summary: Option<RatingSummary> = env
+                .storage()
+                .persistent()
+                .get(&DataKey2::RecruiterRating(recruiter.clone()));
+            match summary {
+                Some(s) if s.rating_count > 0 => {
+                    s.total_stars.saturating_mul(100) / s.rating_count as u64
+                }
+                _ => return base,
+            }
         };
 
-        let discount = summary
-            .total_stars
-            .saturating_mul(config.discount_per_star_ledgers as u64)
-            / summary.rating_count as u64;
+        let discount = stars_x100.saturating_mul(config.discount_per_star_ledgers as u64) / 100;
         let discounted = (base as u64).saturating_sub(discount) as u32;
         discounted.max(config.min_cooldown_ledgers).min(base)
     }

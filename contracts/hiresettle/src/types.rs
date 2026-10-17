@@ -318,6 +318,16 @@ pub struct EngagementConfig {
     /// creation (issue #506). Ignored when `co_recruiter` is `None`. See
     /// `get_co_recruiter_bond` for the forfeiture rule.
     pub co_recruiter_bond_amount: Option<i128>,
+    /// When `true`, payouts on this engagement are credited to the
+    /// recipient's claimable balance instead of being transferred, so a
+    /// recipient that cannot receive tokens never blocks a confirmation
+    /// (issue #547). Recipients withdraw with `claim_payouts`. Default
+    /// `false` keeps push payouts.
+    pub pull_payouts: bool,
+    /// When `true`, the engagement is created in `Offered` status and only
+    /// becomes `Active` once the recruiter calls `accept_engagement`
+    /// (issue #569). Default `false` creates it `Active` as before.
+    pub require_recruiter_acceptance: bool,
 }
 /// Vesting record for a streamed milestone payout (issue #466), stored under
 /// `DataKey::StreamedPayout(engagement_id, milestone_index)`.

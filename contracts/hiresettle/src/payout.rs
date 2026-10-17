@@ -1,4 +1,4 @@
-use soroban_sdk::{contractclient, contractimpl, token, Address, Env, Symbol};
+use soroban_sdk::{contractclient, contractimpl, token, Address, Env, String, Symbol};
 use crate::*;
 
 /// Interface a trusted swap-adapter contract must implement (issue #458).
@@ -126,6 +126,123 @@ impl HireSettleContract {
             _ => {
                 token_client.transfer(&env.current_contract_address(), recipient, &amount);
             }
+        }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #547 — PULL-BASED PAYOUTS
+    // ----------------------------------------------------------
+
+    /// Withdraw everything credited to `recruiter` in `token` by
+    /// `pull_payouts` engagements, and return the amount transferred. Works
+    /// for primary recruiters and co-recruiters alike, and covers milestone
+    /// payouts, streamed-payout claims and bond refunds across every
+    /// engagement. Returns `0` without transferring when nothing is owed.
+    ///
+    /// Credited balances are always in the engagement's escrow token; the
+    /// payout token preference (issue #458) is not applied.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused.
+    ///
+    /// # Events
+    /// `("payouts_claimed", recruiter)` with `(token, amount)` when `amount > 0`.
+    pub fn claim_payouts(env: Env, recruiter: Address, token: Address) -> i128 {
+        Self::assert_not_paused(&env);
+        recruiter.require_auth();
+
+        let key = DataKey2::RecruiterClaimable(recruiter.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return 0;
+        }
+        env.storage().persistent().remove(&key);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recruiter,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "payouts_claimed"), recruiter),
+            (token, amount),
+        );
+        amount
+    }
+
+    /// Amount of `token` credited to `recruiter` and not yet claimed.
+    pub fn get_claimable_payout(env: Env, recruiter: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::RecruiterClaimable(recruiter, token))
+            .unwrap_or(0)
+    }
+
+    /// Whether an engagement was created with `pull_payouts`.
+    pub fn is_pull_payouts_enabled(env: Env, engagement_id: String) -> bool {
+        Self::is_pull_payouts_internal(&env, &engagement_id)
+    }
+
+    pub(crate) fn is_pull_payouts_internal(env: &Env, engagement_id: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::PullPayouts(engagement_id.clone()))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn mark_pull_payouts(env: &Env, engagement_id: &String) {
+        let key = DataKey2::PullPayouts(engagement_id.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    /// Add `amount` to `recipient`'s claimable `token` balance. No-op for a
+    /// non-positive amount.
+    ///
+    /// Emits `("payout_credited", recipient)` with `(engagement_id, token, amount)`.
+    pub(crate) fn credit_claimable_payout(
+        env: &Env,
+        engagement_id: &String,
+        recipient: &Address,
+        token: &Address,
+        amount: i128,
+    ) {
+        if amount <= 0 {
+            return;
+        }
+        let key = DataKey2::RecruiterClaimable(recipient.clone(), token.clone());
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events().publish(
+            (Symbol::new(env, "payout_credited"), recipient.clone()),
+            (engagement_id.clone(), token.clone(), amount),
+        );
+    }
+
+    /// Send a recruiter-side amount that is not a milestone payout (e.g. a
+    /// bond refund): credited on `pull_payouts` engagements, transferred
+    /// otherwise.
+    pub(crate) fn pay_or_credit_recruiter(
+        env: &Env,
+        engagement: &Engagement,
+        token_client: &token::Client,
+        recipient: &Address,
+        amount: i128,
+    ) {
+        if Self::is_pull_payouts_internal(env, &engagement.id) {
+            Self::credit_claimable_payout(
+                env,
+                &engagement.id,
+                recipient,
+                &token_client.address,
+                amount,
+            );
+        } else {
+            token_client.transfer(&env.current_contract_address(), recipient, &amount);
         }
     }
 }

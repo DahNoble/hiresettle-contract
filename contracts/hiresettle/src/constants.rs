@@ -1,6 +1,8 @@
 //! Numeric/default configuration constants used throughout the contract.
 
 pub(crate) const MAX_PLATFORM_FEE_BPS: u32 = 500;
+/// Maximum number of weighted fee treasuries (issue #540).
+pub(crate) const MAX_FEE_TREASURIES: u32 = 10;
 pub(crate) const MAX_ARBITER_FEE_BPS: u32 = 200;
 pub(crate) const FULL_SPLIT_BPS: u32 = 10_000;
 /// Upper bound for `set_min_quorum_ratio_bps` (issue #502): 10 000 bps
