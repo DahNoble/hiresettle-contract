@@ -35,7 +35,7 @@
 //! | `ArbiterFeeTooHigh` | — | `admin::set_arbiter_fee` | 1 |
 //! | `ArbiterNotFound` | — | `transfers::admin_remove_arbiter` | 1 |
 //! | `ArbiterPoolTooSmall` | — | `arbiter_pool::draw_arbiter_panel` | 2 |
-//! | `ArbiterRecused` | — | `disputes::cast_arbiter_vote` | 1 |
+//! | `ArbiterRecused` | — | `disputes::cast_arbiter_split_vote`, `disputes::cast_arbiter_vote` | 2 |
 //! | `ArbiterWeightOverflow` | — | `engagement::create_engagement_impl` | 1 |
 //! | `ArbiterWeightsLengthMismatch` | — | `engagement::create_engagement_impl` | 1 |
 //! | `at least one arbiter required` | — | `bonds::create_engagement_bundle`, `engagement::create_engagement_impl`, `transfers::admin_remove_arbiter` | 3 |
@@ -70,7 +70,7 @@
 //! | `EmptyTreasuryList` | — | `admin::set_fee_treasuries` | 1 |
 //! | `engagement already exists` | — | `engagement::create_engagement_impl` | 1 |
 //! | `engagement is in a terminal state` | — | 5 functions in `admin`, `disputes`, `transfers` | 5 |
-//! | `engagement is not active` | `ERR_ENGAGEMENT_NOT_ACTIVE` | 24 functions in `disputes`, `engagement`, `milestones`, `transfers` | 24 |
+//! | `engagement is not active` | `ERR_ENGAGEMENT_NOT_ACTIVE` | 25 functions in `disputes`, `engagement`, `milestones`, `transfers` | 25 |
 //! | `engagement not found` | — | `helpers::get_engagement_internal` | 1 |
 //! | `EngagementNotCompleted` | — | `ratings::rate_recruiter` | 1 |
 //! | `EngagementNotOffered` | — | `engagement::accept_engagement`, `engagement::withdraw_offer` | 2 |
@@ -112,7 +112,7 @@
 //! | `JobTitleEmpty` | — | `engagement::create_engagement_impl` | 1 |
 //! | `JobTitleTooLong` | — | `engagement::create_engagement_impl` | 1 |
 //! | `MaxDisputeCyclesReached` | — | `disputes::apply_dispute_raised` | 1 |
-//! | `milestone is not in disputed status` | — | 6 functions in `disputes` | 6 |
+//! | `milestone is not in disputed status` | — | 7 functions in `disputes` | 7 |
 //! | `milestone is not in ProofSubmitted status` | — | `disputes::force_confirm_milestone` | 1 |
 //! | `milestone is not locked` | — | `milestones::unlock_milestone` | 1 |
 //! | `milestone is not pending` | — | `milestones::submit_proof_internal`, `milestones::trigger_no_show` | 2 |
@@ -125,7 +125,7 @@
 //! | `MixedVoteModes` | — | `disputes::cast_arbiter_split_vote`, `disputes::cast_arbiter_vote` | 2 |
 //! | `no co_recruiter` | — | `engagement::assert_split_amendment_counterparty`, `engagement::propose_split_amendment` | 2 |
 //! | `no config cosigner` | — | `features::accept_config_change` | 1 |
-//! | `no dispute in progress` | — | `disputes::escalate_dispute` | 1 |
+//! | `no dispute in progress` | — | `disputes::enforce_vote_deadline`, `disputes::escalate_dispute` | 2 |
 //! | `no emergency signers` | — | `features::cast_emergency_pause_vote` | 1 |
 //! | `no escalation timestamp recorded` | — | `disputes::resolve_escalation_timeout` | 1 |
 //! | `no pending admin nomination` | — | `admin::claim_admin` | 1 |
@@ -183,6 +183,8 @@
 //! | `unknown config change fn_id` | — | `features::apply_pending_config_change` | 1 |
 //! | `UpgradeLockNotElapsed` | — | `admin::execute_upgrade` | 1 |
 //! | `VersionTooLong` | — | `admin::set_version` | 1 |
+//! | `VoteDeadlineDisabled` | — | `disputes::enforce_vote_deadline` | 1 |
+//! | `VoteDeadlineNotReached` | — | `disputes::enforce_vote_deadline` | 1 |
 //! | `ZeroMilestones` | — | `engagement::create_engagement_impl` | 1 |
 //!
 //! <!-- END GENERATED ERRORS TABLE -->

@@ -469,5 +469,10 @@ pub enum DataKey2 {
     FeeTreasuries,
     /// Per-company base platform-fee bps override (issue #539).
     CompanyPlatformFee(Address),
+    /// Set once `enforce_vote_deadline` has run on (engagement_id,
+    /// milestone_index) and left the dispute undecided (issue #560); lets
+    /// `escalate_dispute` skip the dispute-window wait. Cleared with the
+    /// dispute's recusals.
+    VoteDeadlineEnforced(String, u32),
 }
 

@@ -369,7 +369,7 @@ pub struct RandomArbiterSetup {
     pub quorum: u32,
 }
 /// Historical dispute-response record for one arbiter (issue #468), updated
-/// by `raise_dispute` and `cast_arbiter_vote`.
+/// by `raise_dispute`, `cast_arbiter_vote` and `enforce_vote_deadline`.
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterStats {
@@ -379,6 +379,9 @@ pub struct ArbiterStats {
     pub votes_cast: u32,
     /// Sum over all cast votes of `vote_ledger - dispute_raised_ledger`.
     pub total_response_ledgers: u64,
+    /// Disputes on which this address was recused by `enforce_vote_deadline`
+    /// for not voting before the vote deadline (issue #560).
+    pub missed_vote_deadlines: u32,
 }
 /// Running total of star ratings a recruiter has received (issue #470).
 /// The average rating is `total_stars / rating_count`.

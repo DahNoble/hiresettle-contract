@@ -919,6 +919,7 @@ Each variant is stored as `DataKey::Config(ConfigKey::…)`.
 | `AmendmentTTL` | Instance | Amendment proposal TTL in ledgers (default 17 280) |
 | `FeeRebateBps` | Persistent | Share of each platform fee credited as a company rebate (#475) |
 | `EmergencyVoteWindow` | Persistent | Emergency pause vote window in ledgers (#474) |
+| `ArbiterVoteDeadline` | Instance | Ledgers after a dispute is raised before non-voting arbiters can be recused; `0` disables it (#560) |
 
 #### `DataKey2` (25 variants)
 
@@ -960,6 +961,7 @@ All `DataKey2` entries are persistent.
 | `PullPayouts(engagement_id)` | Whether the engagement credits payouts instead of pushing them (#547) |
 | `FeeTreasuries` | Weighted fee treasuries `Vec<(Address, u32)>` (#540) |
 | `CompanyPlatformFee(company)` | Per-company base platform-fee override (#539) |
+| `VoteDeadlineEnforced(engagement_id, milestone_index)` | Set when `enforce_vote_deadline` left a dispute undecided, so it can be escalated without waiting out the dispute window (#560) |
 
 ---
 
@@ -1353,6 +1355,7 @@ holds, so a keeper or either party can run them.
 | I want to… | Call |
 |---|---|
 | Move a retention milestone from `Locked` to `Pending` after its unlock ledger | `unlock_milestone` |
+| Recuse arbiters who missed the vote deadline, and settle the dispute on the votes cast | `enforce_vote_deadline` |
 | Send a stalled dispute to the super-arbiter | `escalate_dispute` |
 | Settle an escalated dispute the super-arbiter did not decide in time | `resolve_escalation_timeout` |
 | Forfeit a placement milestone the recruiter never proved in time | `trigger_no_show` |
@@ -1373,7 +1376,7 @@ holds, so a keeper or either party can run them.
 | Split fees across several treasuries | `set_fee_treasuries` / `clear_fee_treasuries` |
 | Manage referrals | `add_referrer`, `remove_referrer`, `set_referral_discount_bps` |
 | Control which tokens and amounts are accepted | `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`, `set_min_amount`, `set_token_min_amount`, `remove_token_min_amount` |
-| Tune timing windows | `set_confirm_window`, `set_dispute_window`, `set_proof_cooldown`, `set_cooldown_rating_discount`, `set_no_show_deadline_ledgers`, `set_amendment_ttl`, `set_super_arbiter_deadline` |
+| Tune timing windows | `set_confirm_window`, `set_dispute_window`, `set_proof_cooldown`, `set_cooldown_rating_discount`, `set_no_show_deadline_ledgers`, `set_amendment_ttl`, `set_super_arbiter_deadline`, `set_arbiter_vote_deadline` |
 | Tune limits | `set_max_active_per_company`, `set_max_replacements` |
 | Configure arbitration | `set_super_arbiter`, `set_arbiter_fee`, `set_split_voting_enabled`, `add_arbiter_pool_member`, `remove_arbiter_pool_member`, `set_bond_forfeit_bps` |
 | Grow or shrink one engagement's arbiter panel | `admin_add_arbiter` / `admin_remove_arbiter` |
@@ -1687,6 +1690,57 @@ Succession swaps one slot for another. To change the panel's size instead, the a
 
 Whenever `new_quorum` is given, it must be between 1 and the new panel's total weight (`invalid quorum`). Both calls panic `PanelChangeDuringDispute` while any milestone is `Disputed`, and reject terminal engagements. Like other admin panel repairs, they still work on a quarantined engagement. Other panics: `DuplicateArbiter`, `CompanyArbiterCollision` and `RecruiterArbiterCollision` on add; `ArbiterNotFound` and `at least one arbiter required` on remove. They emit `arbiter_added` or `arbiter_removed` with `(arbiter, quorum)`.
 
+#### Arbiter Vote Deadline (#560)
+
+A dispute can stall when an arbiter never votes. With a vote deadline
+configured, anyone can recuse the arbiters who have not voted once the
+deadline passes, and the dispute is settled on the votes that were cast.
+
+| Function | Access | Purpose |
+|---|---|---|
+| `set_arbiter_vote_deadline(admin, ledgers)` | Admin | Set the vote deadline in ledgers, measured from when the dispute was raised. `0` (the default) disables it. Emits `arbiter_vote_deadline_set`. |
+| `get_arbiter_vote_deadline()` → `u32` | Public | Return the vote deadline in ledgers (`0` = disabled). |
+| `enforce_vote_deadline(engagement_id, milestone_index)` | Permissionless | Recuse every panel arbiter who has not voted, then settle the dispute on the recomputed quorum or leave it ready to escalate. |
+
+**What enforcement does.** Once the current ledger is past
+`dispute_raised_ledger + deadline`:
+
+1. Every panel arbiter who has not voted, and has not already recused, is
+   added to the dispute's recusal list. This is the same list that
+   `recuse_arbiter` writes, so they can no longer vote (binary or split).
+2. Each of them gets `ArbiterStats::missed_vote_deadlines` incremented. The
+   random-pool selection weight counts a missed deadline as a second unanswered
+   assignment, so `completion = 100 * votes_cast / (disputes_assigned + missed_vote_deadlines)`.
+3. The quorum is recomputed over the weight still on the dispute:
+   `effective_quorum = ceil(quorum * active_weight / total_weight)`, at least 1.
+4. Every arbiter still on the dispute has voted, so the dispute settles
+   right away if anyone voted:
+   - binary votes approve when `approve_weight >= effective_quorum`, and
+     otherwise reject, because `reject_weight > active_weight - effective_quorum`
+     then holds;
+   - split votes settle at the weighted median, as `cast_arbiter_split_vote` would.
+
+   No arbiter fee is paid on a payout settled this way, because no single vote
+   decided it.
+5. If nobody voted, the dispute stays `Disputed` and every arbiter is recused.
+   `escalate_dispute` can then be called right away, without waiting for the
+   dispute window to elapse.
+
+For example, with a 3-arbiter panel and quorum 2, if only one arbiter votes
+before the deadline, the other two are recused, the effective quorum becomes
+`ceil(2 * 1 / 3) = 1`, and the single vote decides the dispute.
+
+Recusals are per dispute. They are cleared when the dispute resolves and when
+a new dispute is raised on the milestone.
+
+| Panic | When |
+|---|---|
+| `VoteDeadlineDisabled` | The vote deadline is `0`. |
+| `engagement is not active` / `milestone is not in disputed status` | There is no live dispute to enforce. |
+| `no dispute in progress` | No dispute raise ledger is recorded for the milestone. |
+| `VoteDeadlineNotReached` | The current ledger is not yet past `dispute_raised_ledger + deadline`. |
+| `NoPendingVoters` | Every panel arbiter has already voted or recused. |
+
 #### Dispute Escalation to Super Arbiter
 
 If a dispute's arbiter votes remain split — neither the approval quorum nor the
@@ -1707,7 +1761,8 @@ only when **all** of the following hold:
 1. The contract and the engagement are not paused.
 2. The engagement is `Active`.
 3. The milestone is `Disputed`.
-4. The dispute window has elapsed (measured from when `raise_dispute` was called).
+4. The dispute window has elapsed (measured from when `raise_dispute` was called),
+   or `enforce_vote_deadline` has run on the dispute (see [Arbiter Vote Deadline](#arbiter-vote-deadline-560)).
 5. Neither approval nor rejection has reached its quorum (the vote is still hung).
 6. A Super Arbiter has been configured.
 
@@ -2191,6 +2246,7 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `upgrade_lock_duration_set` | — | `ledgers` | `set_upgrade_lock_duration` |
 | `max_proof_hash_length_set` | — | `len` | `set_max_proof_hash_length` |
 | `arbiter_fee_set` | — | `bps` | `set_arbiter_fee` |
+| `arbiter_vote_deadline_set` | — | `ledgers` | `set_arbiter_vote_deadline` |
 | `due_soon_window_set` | — | `ledgers` | `set_due_soon_window` |
 | `engagement_paused` | `engagement_id` | `admin` | `pause_engagement` |
 | `engagement_unpaused` | `engagement_id` | `admin` | `unpause_engagement` |
@@ -2246,6 +2302,8 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `dispute_raised` | `engagement_id` | `(milestone_index, reason)` | `raise_dispute` |
 | `arbiter_voted` | `engagement_id` | `(milestone_index, approve)` | `cast_arbiter_vote` |
 | `dispute_resolved` | `engagement_id` | `(milestone_index, approved)` | Quorum reached in `cast_arbiter_vote` |
+| `arbiter_vote_deadline_missed` | `engagement_id` | `(milestone_index, arbiter)` | `enforce_vote_deadline`, once per recused arbiter |
+| `vote_deadline_enforced` | `engagement_id` | `(milestone_index, recused_count, effective_quorum)` | `enforce_vote_deadline`, before any resolution events |
 | `dispute_escalated` | `engagement_id` | `(milestone_index, super_arbiter)` | `escalate_dispute` |
 | `dispute_escalation_resolved` | `engagement_id` | `(milestone_index, super_arbiter, approved)` | `super_arbiter_resolve` |
 | `super_arbiter_timeout_resolved` | `engagement_id` | `milestone_index` | `resolve_escalation_timeout` (auto-favor recruiter) |
@@ -2618,7 +2676,11 @@ The contract uses panic messages (strings) to signal errors instead of a formal 
 | Message | Triggered by | Condition |
 |---|---|---|
 | `duplicate vote` | `cast_arbiter_vote` | This arbiter has already voted on this dispute. Each arbiter may vote once per dispute. |
-| `DisputeWindowNotElapsed` | `escalate_dispute` | The dispute window has not yet elapsed since the dispute was raised. Wait for the window to pass before escalating to the super arbiter. |
+| `DisputeWindowNotElapsed` | `escalate_dispute` | The dispute window has not yet elapsed since the dispute was raised, and `enforce_vote_deadline` has not run on it. Wait for the window to pass before escalating to the super arbiter. |
+| `ArbiterRecused` | `cast_arbiter_vote` or `cast_arbiter_split_vote` | The arbiter recused from this dispute, or was recused by `enforce_vote_deadline`. |
+| `VoteDeadlineDisabled` | `enforce_vote_deadline` | The admin has not set a vote deadline (`set_arbiter_vote_deadline`). |
+| `VoteDeadlineNotReached` | `enforce_vote_deadline` | The vote deadline has not passed since the dispute was raised. Check `get_arbiter_vote_deadline()`. |
+| `NoPendingVoters` | `enforce_vote_deadline` | Every panel arbiter has already voted or recused, so there is no one to recuse. |
 | `dispute already resolvable without escalation` | `escalate_dispute` | The dispute has already reached quorum (or rejection threshold) and can be resolved via normal arbiter voting. Escalation is only for tied disputes past the window. |
 | `no super arbiter configured` | `escalate_dispute` or `super_arbiter_resolve` | The admin has not set a super arbiter via `set_super_arbiter()`. Either the admin must configure one, or the dispute must be resolved through normal arbiter voting. |
 | `no dispute in progress` | `escalate_dispute` | Attempted to escalate a dispute that was not found in the vote tally. The dispute may have already resolved. |
