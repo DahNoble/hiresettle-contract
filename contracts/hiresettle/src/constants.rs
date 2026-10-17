@@ -1,7 +1,12 @@
 //! Numeric/default configuration constants used throughout the contract.
 
 pub(crate) const MAX_PLATFORM_FEE_BPS: u32 = 500;
+/// Maximum number of weighted fee treasuries (issue #540).
+pub(crate) const MAX_FEE_TREASURIES: u32 = 10;
 pub(crate) const MAX_ARBITER_FEE_BPS: u32 = 200;
+/// Default recruiter swap-slippage tolerance for converted payouts
+/// (issue #549): 100 bps = 1 %.
+pub(crate) const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 100;
 pub(crate) const FULL_SPLIT_BPS: u32 = 10_000;
 /// Upper bound for `set_min_quorum_ratio_bps` (issue #502): 10 000 bps
 /// (100 %) forces a unanimous panel.
@@ -83,3 +88,11 @@ pub(crate) const DEFAULT_RISK_DISPUTE_WEIGHT: u32 = 30;
 pub(crate) const DEFAULT_RISK_REPLACEMENT_WEIGHT: u32 = 20;
 /// Default risk-score points per granted milestone extension (issue #480).
 pub(crate) const DEFAULT_RISK_EXTENSION_WEIGHT: u32 = 10;
+
+/// Schema version stamped onto every emitted event (issue #585).
+///
+/// Bump this whenever any event's topics or data change so indexers can
+/// detect payload-shape changes instead of breaking silently. The value is
+/// appended as the last topic of every `env.events().publish` call and is
+/// exposed to off-chain consumers via `get_event_schema_version()`.
+pub(crate) const EVENT_SCHEMA_VERSION: u32 = 1;

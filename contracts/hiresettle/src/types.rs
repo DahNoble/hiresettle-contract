@@ -1,7 +1,7 @@
 //! Contract data structs (`#[contracttype]`).
 
 use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
-use crate::{EngagementStatus, MilestoneKind, MilestoneStatus, TimelineKind};
+use crate::{ActionKind, ActorRole, EngagementStatus, MilestoneKind, MilestoneStatus, TimelineKind};
 
 /// A payment and workflow checkpoint belonging to an [`Engagement`]'s `milestones`.
 #[contracttype]
@@ -253,6 +253,18 @@ pub struct PlatformFee {
     /// Address that receives accumulated platform fees.
     pub treasury: Address,
 }
+/// Platform-fee change scheduled by `schedule_platform_fee` (issue #541),
+/// applied by `apply_scheduled_fee` once `effective_after_ledger` is reached.
+#[contracttype]
+#[derive(Clone)]
+pub struct ScheduledPlatformFee {
+    /// New fee in basis points, capped at 500 (5%).
+    pub bps: u32,
+    /// New treasury address.
+    pub treasury: Address,
+    /// Ledger at or after which `apply_scheduled_fee` may apply the change.
+    pub effective_after_ledger: u32,
+}
 /// A single fee-tier bracket: engagements whose `total_amount` is at or above
 /// `threshold` pay `bps` instead of the default platform-fee rate.
 /// Configured via `set_fee_tiers` (issue #250).
@@ -318,6 +330,16 @@ pub struct EngagementConfig {
     /// creation (issue #506). Ignored when `co_recruiter` is `None`. See
     /// `get_co_recruiter_bond` for the forfeiture rule.
     pub co_recruiter_bond_amount: Option<i128>,
+    /// When `true`, payouts on this engagement are credited to the
+    /// recipient's claimable balance instead of being transferred, so a
+    /// recipient that cannot receive tokens never blocks a confirmation
+    /// (issue #547). Recipients withdraw with `claim_payouts`. Default
+    /// `false` keeps push payouts.
+    pub pull_payouts: bool,
+    /// When `true`, the engagement is created in `Offered` status and only
+    /// becomes `Active` once the recruiter calls `accept_engagement`
+    /// (issue #569). Default `false` creates it `Active` as before.
+    pub require_recruiter_acceptance: bool,
 }
 /// Vesting record for a streamed milestone payout (issue #466), stored under
 /// `DataKey::StreamedPayout(engagement_id, milestone_index)`.
@@ -560,4 +582,22 @@ pub struct RiskScoreWeights {
     pub replacement_weight: u32,
     /// Points per granted milestone extension.
     pub extension_weight: u32,
+}
+
+/// The next actionable step on an engagement, returned by `get_next_action`
+/// (issue #556).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NextAction {
+    /// Who has to make the call.
+    pub actor: ActorRole,
+    /// Which call to make.
+    pub action: ActionKind,
+    /// The milestone the call targets; `None` for engagement-level proposals.
+    pub milestone_index: Option<u32>,
+    /// Earliest ledger at which the call succeeds. Equals the current ledger
+    /// when it can be made right away; otherwise
+    /// `available_at_ledger - current_ledger` is the wait (e.g. the
+    /// `ledgers_until_unlock` of a locked milestone).
+    pub available_at_ledger: u32,
 }

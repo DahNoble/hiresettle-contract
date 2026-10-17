@@ -58,6 +58,9 @@ impl HireSettleContract {
     /// `bps` is capped at 500 (5%).
     /// When a config cosigner is set and this setter is marked sensitive
     /// (issue #473), stores a pending change instead of applying immediately.
+    /// When a non-zero fee-change delay is configured (issue #541), the change
+    /// is scheduled exactly as by [`Self::schedule_platform_fee`] instead of
+    /// applied; with the default delay of 0 it applies immediately.
     pub fn set_platform_fee(env: Env, admin: Address, bps: u32, treasury: Address) {
         Self::assert_not_paused(&env);
         Self::assert_admin(&env, &admin);
@@ -78,6 +81,172 @@ impl HireSettleContract {
             return;
         }
 
+        Self::set_or_schedule_platform_fee(&env, bps, treasury);
+    }
+
+    /// Return the current platform fee configuration.
+    pub fn get_platform_fee(env: Env) -> (u32, Address) {
+        let fee = Self::get_platform_fee_internal(&env);
+        (fee.bps, fee.treasury)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #541 — SCHEDULED PLATFORM FEE CHANGES
+    // ----------------------------------------------------------
+
+    /// Admin schedules a platform-fee change that takes effect only after the
+    /// fee-change delay, so parties funding an engagement can see a new rate
+    /// coming before it is charged. Mirrors the upgrade time-lock (issue #69):
+    /// scheduling again while a change is pending **overwrites** it and
+    /// restarts the countdown from the current ledger.
+    ///
+    /// Not subject to the config-cosigner gate (issue #473); the delay is the
+    /// safeguard here.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused.
+    /// - `"unauthorized"` — caller is not the admin.
+    /// - `"FeeTooHigh"` — `bps` exceeds 500.
+    ///
+    /// # Events
+    /// `("fee_change_scheduled",)` with `(bps, treasury, effective_after_ledger)`.
+    pub fn schedule_platform_fee(env: Env, admin: Address, bps: u32, treasury: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        if bps > MAX_PLATFORM_FEE_BPS {
+            panic!("FeeTooHigh");
+        }
+
+        Self::schedule_platform_fee_internal(&env, bps, treasury);
+    }
+
+    /// Apply the scheduled platform-fee change once its delay has elapsed.
+    /// Permissionless — anyone may call this once `effective_after_ledger` is
+    /// reached, like `execute_upgrade`.
+    ///
+    /// # Panics
+    /// - `"NoScheduledFee"` — no change is scheduled.
+    /// - `"FeeChangeDelayNotElapsed"` — the current ledger is before
+    ///   `effective_after_ledger`.
+    ///
+    /// # Events
+    /// `("fee_change_applied",)` with `(bps, treasury)`, followed by the usual
+    /// `("platform_fee_set",)` with `(bps, treasury)`.
+    pub fn apply_scheduled_fee(env: Env) {
+        let scheduled: ScheduledPlatformFee = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ScheduledPlatformFee)
+            .unwrap_or_else(|| panic!("NoScheduledFee"));
+
+        if env.ledger().sequence() < scheduled.effective_after_ledger {
+            panic!("FeeChangeDelayNotElapsed");
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey2::ScheduledPlatformFee);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_change_applied"),),
+            (scheduled.bps, scheduled.treasury.clone()),
+        );
+        Self::write_platform_fee(&env, scheduled.bps, scheduled.treasury);
+    }
+
+    /// Admin cancels the scheduled platform-fee change; the current fee stays
+    /// in effect.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the admin.
+    /// - `"NoScheduledFee"` — no change is scheduled.
+    ///
+    /// # Events
+    /// `("fee_change_cancelled",)` with `(bps, treasury)` of the cancelled change.
+    pub fn cancel_scheduled_fee(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+
+        let scheduled: ScheduledPlatformFee = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ScheduledPlatformFee)
+            .unwrap_or_else(|| panic!("NoScheduledFee"));
+
+        env.storage()
+            .instance()
+            .remove(&DataKey2::ScheduledPlatformFee);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_change_cancelled"),),
+            (scheduled.bps, scheduled.treasury),
+        );
+    }
+
+    /// Return the scheduled platform-fee change as
+    /// `(bps, treasury, effective_after_ledger)`, or `None` if none is pending.
+    pub fn get_scheduled_fee(env: Env) -> Option<(u32, Address, u32)> {
+        env.storage()
+            .instance()
+            .get::<DataKey2, ScheduledPlatformFee>(&DataKey2::ScheduledPlatformFee)
+            .map(|s| (s.bps, s.treasury, s.effective_after_ledger))
+    }
+
+    /// Admin sets how many ledgers a scheduled platform-fee change must wait
+    /// before it can be applied. `0` (the default) keeps `set_platform_fee`
+    /// immediate. Changing the delay does not move the `effective_after_ledger`
+    /// of a change that is already scheduled.
+    ///
+    /// # Events
+    /// `("fee_change_delay_set",)` with `ledgers`.
+    pub fn set_fee_change_delay(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::FeeChangeDelay), &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "fee_change_delay_set"),), ledgers);
+    }
+
+    /// Return the fee-change delay in ledgers (default `0`).
+    pub fn get_fee_change_delay(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::FeeChangeDelay))
+            .unwrap_or(0u32)
+    }
+
+    /// Apply a validated platform-fee change now when the fee-change delay is
+    /// `0`, otherwise schedule it (issue #541). Shared by `set_platform_fee`
+    /// and a cosigner-accepted `FN_SET_PLATFORM_FEE` change (issue #473).
+    pub(crate) fn set_or_schedule_platform_fee(env: &Env, bps: u32, treasury: Address) {
+        if Self::get_fee_change_delay(env.clone()) == 0 {
+            Self::write_platform_fee(env, bps, treasury);
+        } else {
+            Self::schedule_platform_fee_internal(env, bps, treasury);
+        }
+    }
+
+    fn schedule_platform_fee_internal(env: &Env, bps: u32, treasury: Address) {
+        let effective_after_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(Self::get_fee_change_delay(env.clone()));
+        env.storage().instance().set(
+            &DataKey2::ScheduledPlatformFee,
+            &ScheduledPlatformFee {
+                bps,
+                treasury: treasury.clone(),
+                effective_after_ledger,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(env, "fee_change_scheduled"),),
+            (bps, treasury, effective_after_ledger),
+        );
+    }
+
+    fn write_platform_fee(env: &Env, bps: u32, treasury: Address) {
         env.storage().persistent().set(
             &DataKey::PlatformFee,
             &PlatformFee {
@@ -85,15 +254,8 @@ impl HireSettleContract {
                 treasury: treasury.clone(),
             },
         );
-
         env.events()
-            .publish((Symbol::new(&env, "platform_fee_set"),), (bps, treasury));
-    }
-
-    /// Return the current platform fee configuration.
-    pub fn get_platform_fee(env: Env) -> (u32, Address) {
-        let fee = Self::get_platform_fee_internal(&env);
-        (fee.bps, fee.treasury)
+            .publish((Symbol::new(env, "platform_fee_set"),), (bps, treasury));
     }
 
     /// Set the minimum absolute platform fee charged per fee-bearing payout
@@ -153,6 +315,124 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .get(&DataKey2::TokenPlatformFee(token))
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #539 — PER-COMPANY PLATFORM FEE OVERRIDE
+    // ----------------------------------------------------------
+
+    /// Override the base platform-fee bps for every engagement whose company
+    /// is `company`, on every payout path. Takes precedence over the per-token
+    /// override, fee tiers (live or snapshotted) and the global rate; an
+    /// engagement fee waiver still wins over it, and the referral discount,
+    /// fee floor and rebate still apply on top. Capped at 500 bps like
+    /// `set_platform_fee`.
+    ///
+    /// # Panics
+    /// - `"FeeTooHigh"` — `bps` exceeds 500.
+    pub fn set_company_platform_fee(env: Env, admin: Address, company: Address, bps: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if bps > MAX_PLATFORM_FEE_BPS {
+            panic!("FeeTooHigh");
+        }
+        let key = DataKey2::CompanyPlatformFee(company.clone());
+        env.storage().persistent().set(&key, &bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events()
+            .publish((Symbol::new(&env, "company_platform_fee_set"),), (company, bps));
+    }
+
+    /// Remove a company's fee override; its engagements fall back to the
+    /// token / tier / global resolution.
+    pub fn remove_company_platform_fee(env: Env, admin: Address, company: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::CompanyPlatformFee(company.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "company_platform_fee_removed"),), company);
+    }
+
+    /// Return the company's base bps override, if any.
+    pub fn get_company_platform_fee(env: Env, company: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::CompanyPlatformFee(company))
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #540 — MULTI-TREASURY FEE ROUTING
+    // ----------------------------------------------------------
+
+    /// Split every collected platform fee across weighted treasuries. Each
+    /// entry is `(treasury, weight_bps)`; weights must sum to exactly 10 000.
+    /// Rounding dust goes to the first treasury, so the full fee is always
+    /// transferred. Replaces any existing list; while a list is set,
+    /// `PlatformFee.treasury` receives nothing (unless it is in the list).
+    ///
+    /// # Panics
+    /// - `"EmptyTreasuryList"` — `treasuries` is empty (use
+    ///   [`Self::clear_fee_treasuries`] to go back to the single treasury).
+    /// - `"TooManyTreasuries"` — more than 10 entries.
+    /// - `"InvalidTreasuryWeight"` — a weight is zero.
+    /// - `"DuplicateTreasury"` — an address appears twice.
+    /// - `"TreasuryWeightsMustSumTo10000"` — weights do not sum to 10 000.
+    pub fn set_fee_treasuries(env: Env, admin: Address, treasuries: Vec<(Address, u32)>) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if treasuries.is_empty() {
+            panic!("EmptyTreasuryList");
+        }
+        if treasuries.len() > MAX_FEE_TREASURIES {
+            panic!("TooManyTreasuries");
+        }
+        let mut total: u64 = 0;
+        for i in 0..treasuries.len() {
+            let (treasury, weight) = treasuries.get(i).unwrap();
+            if weight == 0 {
+                panic!("InvalidTreasuryWeight");
+            }
+            for j in 0..i {
+                if treasuries.get(j).unwrap().0 == treasury {
+                    panic!("DuplicateTreasury");
+                }
+            }
+            total += weight as u64;
+        }
+        if total != FULL_SPLIT_BPS as u64 {
+            panic!("TreasuryWeightsMustSumTo10000");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey2::FeeTreasuries, &treasuries);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey2::FeeTreasuries, 100_000, 6_300_000);
+        env.events()
+            .publish((Symbol::new(&env, "fee_treasuries_set"),), treasuries);
+    }
+
+    /// Remove the weighted treasury list; fees go to `PlatformFee.treasury`
+    /// again.
+    pub fn clear_fee_treasuries(env: Env, admin: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        env.storage().persistent().remove(&DataKey2::FeeTreasuries);
+        env.events()
+            .publish((Symbol::new(&env, "fee_treasuries_cleared"),), ());
+    }
+
+    /// Return the weighted treasury list, or an empty vector when fees go to
+    /// the single `PlatformFee.treasury`.
+    pub fn get_fee_treasuries(env: Env) -> Vec<(Address, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::FeeTreasuries)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Set the weights used by `get_engagement_risk_score` (issue #480).
@@ -1087,7 +1367,8 @@ impl HireSettleContract {
     /// updated by the admin via `set_inactivity_timeout_ledgers`.
     ///
     /// # Behaviour
-    /// - The engagement must not be `Completed`.
+    /// - The engagement must not be `Completed`, `Cancelled` or `Expired`. An `Offered`
+    ///   engagement (issue #569) the recruiter never accepted can be expired.
     /// - Any escrow balance not yet released (`total_amount - released_amount`) is transferred
     ///   back to the company address.
     /// - The engagement status is set to `Expired`.
@@ -1095,6 +1376,8 @@ impl HireSettleContract {
     /// # Panics
     /// - `"Cannot expire completed engagement"` — engagement is already `Completed`.
     /// - `"Inactivity timeout not reached"` — the inactivity threshold has not yet been reached.
+    /// - `"engagement is in a terminal state"` — the engagement is already `Cancelled` or
+    ///   `Expired` (checked after the timeout), so its escrow was already refunded.
     ///
     /// # Events
     /// Emits `("engagement_expired", engagement_id)` with the refund amount.
@@ -1111,6 +1394,13 @@ impl HireSettleContract {
 
         if current_ledger <= engagement.last_activity_ledger + timeout {
             panic!("Inactivity timeout not reached");
+        }
+
+        // A Cancelled or Expired engagement already refunded its unreleased
+        // escrow (without touching `released_amount`), so expiring it again
+        // would pay the same refund out a second time.
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
         }
 
         let refund = engagement.total_amount - engagement.released_amount;

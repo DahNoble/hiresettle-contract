@@ -131,7 +131,8 @@ impl HireSettleContract {
             .unwrap_or(0)
     }
 
-    /// Count the recruiter's engagements currently in `Active` status.
+    /// Count the recruiter's engagements currently in `Active` status, plus
+    /// pending `Offered` ones (issue #569), which already hold a cap slot.
     fn recruiter_active_count(env: &Env, recruiter: &Address) -> u32 {
         let ids: Vec<String> = env
             .storage()
@@ -142,7 +143,11 @@ impl HireSettleContract {
         for id in ids.iter() {
             let engagement: Option<Engagement> =
                 env.storage().persistent().get(&DataKey::Engagement(id));
-            if matches!(engagement, Some(e) if e.status == EngagementStatus::Active) {
+            if matches!(
+                engagement,
+                Some(e) if e.status == EngagementStatus::Active
+                    || e.status == EngagementStatus::Offered
+            ) {
                 count += 1;
             }
         }
@@ -478,7 +483,12 @@ impl HireSettleContract {
             created_at_ledger: current_ledger,
             last_activity_ledger: current_ledger,
             milestones: resolved_milestones,
-            status: EngagementStatus::Active,
+            // Issue #569: wait for the recruiter's consent when requested.
+            status: if config.require_recruiter_acceptance {
+                EngagementStatus::Offered
+            } else {
+                EngagementStatus::Active
+            },
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
@@ -493,6 +503,11 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
 
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        // Issue #547: credit payouts instead of pushing them.
+        if config.pull_payouts {
+            Self::mark_pull_payouts(&env, &engagement_id);
+        }
 
         // Issue #505: freeze the tier-resolved rate (or the base rate when no
         // tier matches) so later `set_fee_tiers` calls cannot change it.
@@ -616,8 +631,132 @@ impl HireSettleContract {
             ),
             engagement_id.clone(),
         );
+        if config.require_recruiter_acceptance {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "engagement_offered"),
+                    engagement_id.clone(),
+                ),
+                (company, recruiter, total_amount),
+            );
+        }
 
         engagement_id
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #569 — RECRUITER ACCEPTANCE STEP
+    // ----------------------------------------------------------
+
+    /// Recruiter (or their co-signer) accepts an `Offered` engagement, moving
+    /// it to `Active`. Placement milestones' no-show clocks start from this
+    /// ledger rather than from creation. Retention time gates are unchanged:
+    /// they were fixed relative to creation.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` / `"EngagementPaused"`
+    /// - `"EngagementNotOffered"` — the engagement is not in `Offered` status.
+    /// - `"unauthorized"` — caller is not the recruiter or their co-signer.
+    ///
+    /// # Events
+    /// `("engagement_accepted", engagement_id)` with the recruiter address,
+    /// plus the `Offered → Active` status-change event.
+    pub fn accept_engagement(env: Env, recruiter: Address, engagement_id: String) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        recruiter.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if engagement.status != EngagementStatus::Offered {
+            panic!("EngagementNotOffered");
+        }
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        for i in 0..engagement.milestones.len() {
+            let m = engagement.milestones.get(i).unwrap();
+            if m.kind == MilestoneKind::Placement && m.status == MilestoneStatus::Pending {
+                Self::mark_milestone_pending_since(&env, &engagement_id, i);
+            }
+        }
+
+        engagement.status = EngagementStatus::Active;
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            EngagementStatus::Offered,
+            EngagementStatus::Active,
+            Some(recruiter.clone()),
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_accepted"),
+                engagement_id,
+            ),
+            recruiter,
+        );
+    }
+
+    /// Company (or its co-signer) withdraws an `Offered` engagement before
+    /// the recruiter accepts it. The full escrow is refunded (to the pool for
+    /// pool-funded engagements), any bonds are returned, and the engagement
+    /// moves to `Cancelled`, freeing its active-engagement cap slots.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` / `"EngagementPaused"`
+    /// - `"EngagementNotOffered"` — the engagement is not in `Offered` status.
+    /// - `"unauthorized"` — caller is not the company or its co-signer.
+    ///
+    /// # Events
+    /// `("offer_withdrawn", engagement_id)` with the refund amount, plus the
+    /// `Offered → Cancelled` status-change event.
+    pub fn withdraw_offer(env: Env, company: Address, engagement_id: String) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        company.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if engagement.status != EngagementStatus::Offered {
+            panic!("EngagementNotOffered");
+        }
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let refund = engagement.total_amount - engagement.released_amount;
+        Self::refund_company_escrow(&env, &engagement, &engagement_id, refund);
+
+        engagement.status = EngagementStatus::Cancelled;
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            EngagementStatus::Offered,
+            EngagementStatus::Cancelled,
+            Some(company.clone()),
+        );
+
+        Self::decrement_company_active_count(&env, &engagement.company);
+        Self::settle_bonds(&env, &engagement);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "offer_withdrawn"),
+                engagement_id,
+            ),
+            refund,
+        );
     }
 
     // ----------------------------------------------------------
