@@ -13481,3 +13481,384 @@ fn test_config_snapshot_includes_config_change_ttl() {
     let snapshot = client.get_config_snapshot();
     assert_eq!(snapshot.config_change_ttl_ledgers, 50_000u32);
 }
+
+// ============================================================
+// SUPER ARBITER PANEL (M-of-N ESCALATION RESOLUTION)
+// ============================================================
+
+/// Setting panel with quorum of 0 panics with InvalidQuorum.
+#[test]
+#[should_panic(expected = "InvalidQuorum")]
+fn test_set_super_arbiter_panel_quorum_zero_panics() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let panel = SuperArbiterPanel {
+        members: vec![&env, company.clone()],
+        quorum: 0,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+}
+
+/// Setting panel with quorum > members panics with InvalidQuorum.
+#[test]
+#[should_panic(expected = "InvalidQuorum")]
+fn test_set_super_arbiter_panel_quorum_exceeds_members_panics() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let panel = SuperArbiterPanel {
+        members: vec![&env, company.clone(), recruiter.clone()],
+        quorum: 3,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+}
+
+/// Setting panel with duplicate members panics with DuplicatePanelMember.
+#[test]
+#[should_panic(expected = "DuplicatePanelMember")]
+fn test_set_super_arbiter_panel_duplicate_members_panics() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let panel = SuperArbiterPanel {
+        members: vec![&env, company.clone(), company.clone()],
+        quorum: 1,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+}
+
+/// Setting panel when single super arbiter exists panics with SuperArbiterMutualExclusivity.
+#[test]
+#[should_panic(expected = "SuperArbiterMutualExclusivity")]
+fn test_set_super_arbiter_panel_mutual_exclusivity_panics() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let super_arbiter = Address::generate(&env);
+    client.set_super_arbiter(&company, &super_arbiter);
+
+    let panel = SuperArbiterPanel {
+        members: vec![&env, recruiter.clone()],
+        quorum: 1,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+}
+
+/// Setting single super arbiter when panel exists should also panic.
+#[test]
+#[should_panic(expected = "SuperArbiterMutualExclusivity")]
+fn test_set_super_arbiter_after_panel_panics() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let panel = SuperArbiterPanel {
+        members: vec![&env, recruiter.clone()],
+        quorum: 1,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+
+    let super_arbiter = Address::generate(&env);
+    client.set_super_arbiter(&company, &super_arbiter);
+}
+
+/// Non-admin cannot set super arbiter panel.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_super_arbiter_panel_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let panel = SuperArbiterPanel {
+        members: vec![&env, recruiter.clone()],
+        quorum: 1,
+    };
+    client.set_super_arbiter_panel(&recruiter, &panel);
+}
+
+/// Panel members can vote on escalated disputes.
+#[test]
+fn test_panel_vote_escalated_dispute_resolution() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Set up a 3-member panel with quorum 2
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let panel = SuperArbiterPanel {
+        members: vec![&env, p1.clone(), p2.clone(), p3.clone()],
+        quorum: 2,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+
+    let eng_id = String::from_str(&env, "ENG-PANEL-1");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PANEL-1",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // Cast a split vote (1 approve, 1 reject) - neither quorum nor rejection threshold
+    let a2 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+
+    // Advance past dispute window
+    advance_ledger(&env, 52_000);
+
+    // Escalate to panel
+    client.escalate_dispute(&eng_id, &0);
+
+    // Panel votes: 2 approve reaches quorum -> dispute resolved
+    client.cast_panel_vote(&p1, &eng_id, &0, &true);
+    client.cast_panel_vote(&p2, &eng_id, &0, &true);
+
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+
+    // Resolution counter should increment
+    assert_eq!(client.get_super_arbiter_resolutions(), 1u64);
+}
+
+/// Non-panel members cannot vote on escalated disputes.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_panel_vote_non_member_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let p1 = Address::generate(&env);
+    let panel = SuperArbiterPanel {
+        members: vec![&env, p1.clone()],
+        quorum: 1,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+
+    let eng_id = String::from_str(&env, "ENG-PANEL-2");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PANEL-2",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    let a2 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+
+    advance_ledger(&env, 52_000);
+    client.escalate_dispute(&eng_id, &0);
+
+    // Try to vote as a non-member
+    client.cast_panel_vote(&recruiter, &eng_id, &0, &true);
+}
+
+/// Double voting on panel panics with "already voted".
+#[test]
+#[should_panic(expected = "already voted")]
+fn test_panel_vote_double_vote_panics() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let panel = SuperArbiterPanel {
+        members: vec![&env, p1.clone(), p2.clone()],
+        quorum: 2,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+
+    let eng_id = String::from_str(&env, "ENG-PANEL-3");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PANEL-3",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    let a2 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+
+    advance_ledger(&env, 52_000);
+    client.escalate_dispute(&eng_id, &0);
+
+    // First vote
+    client.cast_panel_vote(&p1, &eng_id, &0, &true);
+
+    // Try to vote again
+    client.cast_panel_vote(&p1, &eng_id, &0, &true);
+}
+
+/// Panel rejection threshold works (reject > members - quorum).
+#[test]
+fn test_panel_vote_rejection_threshold() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // 3-member panel, quorum 2 -> rejection threshold is 2 (3 - 2 = 1, so >1 means 2)
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let panel = SuperArbiterPanel {
+        members: vec![&env, p1.clone(), p2.clone(), p3.clone()],
+        quorum: 2,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+
+    let eng_id = String::from_str(&env, "ENG-PANEL-4");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PANEL-4",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    let a2 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+
+    advance_ledger(&env, 52_000);
+    client.escalate_dispute(&eng_id, &0);
+
+    // 2 reject votes reaches rejection threshold -> milestone reset to Pending
+    client.cast_panel_vote(&p1, &eng_id, &0, &false);
+    client.cast_panel_vote(&p2, &eng_id, &0, &false);
+
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Pending);
+    assert_eq!(m0.proof_hash, String::from_str(&env, ""));
+}
+
+/// get_super_arbiter_resolutions increments on each resolution.
+#[test]
+fn test_get_super_arbiter_resolutions_increments() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Initial count should be 0
+    assert_eq!(client.get_super_arbiter_resolutions(), 0u64);
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let panel = SuperArbiterPanel {
+        members: vec![&env, p1.clone(), p2.clone()],
+        quorum: 2,
+    };
+    client.set_super_arbiter_panel(&company, &panel);
+
+    // First resolution
+    let eng_id1 = String::from_str(&env, "ENG-PANEL-5");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PANEL-5",
+    );
+
+    client.submit_proof(&recruiter, &eng_id1, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id1, &0, &String::from_str(&env, "dispute"));
+
+    let a2 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id1, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id1, &0, &false);
+
+    advance_ledger(&env, 52_000);
+    client.escalate_dispute(&eng_id1, &0);
+    client.cast_panel_vote(&p1.clone(), &eng_id1, &0, &true);
+    client.cast_panel_vote(&p2.clone(), &eng_id1, &0, &true);
+
+    assert_eq!(client.get_super_arbiter_resolutions(), 1u64);
+
+    // Second resolution
+    let eng_id2 = String::from_str(&env, "ENG-PANEL-6");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PANEL-6",
+    );
+
+    client.submit_proof(&recruiter, &eng_id2, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id2, &0, &String::from_str(&env, "dispute"));
+
+    let a3 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id2, &0, &true);
+    client.cast_arbiter_vote(&a3, &eng_id2, &0, &false);
+
+    advance_ledger(&env, 52_000);
+    client.escalate_dispute(&eng_id2, &0);
+    client.cast_panel_vote(&p1, &eng_id2, &0, &true);
+    client.cast_panel_vote(&p2, &eng_id2, &0, &true);
+
+    assert_eq!(client.get_super_arbiter_resolutions(), 2u64);
+}
+
+/// Single super arbiter still works when no panel is configured.
+#[test]
+fn test_single_super_arbiter_still_works() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let super_arbiter = Address::generate(&env);
+    client.set_super_arbiter(&company, &super_arbiter);
+
+    let eng_id = String::from_str(&env, "ENG-SINGLE-SA");
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-SINGLE-SA",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    let a2 = Address::generate(&env);
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+
+    advance_ledger(&env, 52_000);
+    client.escalate_dispute(&eng_id, &0);
+
+    // Single super arbiter resolves
+    client.super_arbiter_resolve(&super_arbiter, &eng_id, &0, &true);
+
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+}

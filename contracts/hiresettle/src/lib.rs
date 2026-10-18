@@ -339,6 +339,18 @@ pub struct PendingConfigChange {
     pub cancelled: bool,
 }
 
+/// Super arbiter panel configuration for M-of-N escalated dispute resolution.
+/// When configured, escalated disputes require quorum votes from panel members
+/// instead of a single super arbiter.
+#[contracttype]
+#[derive(Clone)]
+pub struct SuperArbiterPanel {
+    /// Ordered list of panel member addresses eligible to vote on escalated disputes.
+    pub members: Vec<Address>,
+    /// Number of votes required to resolve an escalated dispute (M-of-N).
+    pub quorum: u32,
+}
+
 /// Platform fee configuration deducted from each milestone payment.
 #[contracttype]
 #[derive(Clone)]
@@ -652,6 +664,9 @@ pub enum DataKey {
     /// Whether a disputed (engagement_id, milestone_index) has been auto-escalated
     /// to the super arbiter (issue #246).
     EscalatedDispute(String, u32),
+    /// Vote tally for an escalated (engagement_id, milestone_index) when using
+    /// a super arbiter panel (M-of-N resolution).
+    EscalatedDisputeVotes(String, u32),
     /// Per-tag index mapping tag string to list of engagement IDs (issue #248, #249).
     TagEngagements(String),
     /// Set once a `milestone_due_soon` event has been emitted for
@@ -670,6 +685,10 @@ pub enum DataKey {
     PendingConfigChange(u32),
     /// Counter for config change proposals (instance storage).
     ConfigChangeCount,
+    /// Super arbiter panel configuration for M-of-N escalated dispute resolution.
+    SuperArbiterPanel,
+    /// Counter tracking total number of super arbiter panel resolutions.
+    SuperArbiterResolutions,
     /// Wraps a `ConfigKey` so every admin-tunable scalar setting shares one
     /// `DataKey` variant instead of each needing its own. See `ConfigKey`.
     Config(ConfigKey),
@@ -2510,6 +2529,59 @@ impl HireSettleContract {
         env.storage().instance().get(&DataKey::SuperArbiter)
     }
 
+    /// Admin sets (or replaces) the super arbiter panel for M-of-N escalated
+    /// dispute resolution. Mutually exclusive with the single super arbiter.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the admin.
+    /// - `"InvalidQuorum"` — quorum is 0 or greater than the number of panel members.
+    /// - `"DuplicatePanelMember"` — duplicate addresses in the members list.
+    /// - `"SuperArbiterMutualExclusivity"` — a single super arbiter is already configured.
+    pub fn set_super_arbiter_panel(env: Env, admin: Address, panel: SuperArbiterPanel) {
+        Self::assert_admin(&env, &admin);
+
+        // Check mutual exclusivity with single super arbiter
+        if env.storage().instance().has(&DataKey::SuperArbiter) {
+            panic!("SuperArbiterMutualExclusivity");
+        }
+
+        // Validate quorum
+        if panel.quorum == 0 {
+            panic!("InvalidQuorum");
+        }
+        if panel.quorum > panel.members.len() {
+            panic!("InvalidQuorum");
+        }
+
+        // Check for duplicate members
+        for i in 0..panel.members.len() {
+            for j in (i + 1)..panel.members.len() {
+                if panel.members.get(i).unwrap() == panel.members.get(j).unwrap() {
+                    panic!("DuplicatePanelMember");
+                }
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SuperArbiterPanel, &panel);
+        env.events()
+            .publish((Symbol::new(&env, "super_arbiter_panel_set"),), panel.members.len());
+    }
+
+    /// Return the currently configured super arbiter panel, if any.
+    pub fn get_super_arbiter_panel(env: Env) -> Option<SuperArbiterPanel> {
+        env.storage().instance().get(&DataKey::SuperArbiterPanel)
+    }
+
+    /// Return the total number of super arbiter panel resolutions (for analytics).
+    pub fn get_super_arbiter_resolutions(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SuperArbiterResolutions)
+            .unwrap_or(0u64)
+    }
+
     /// Return whether a disputed milestone has been auto-escalated to the
     /// super arbiter.
     pub fn is_dispute_escalated(env: Env, engagement_id: String, milestone_index: u32) -> bool {
@@ -2587,11 +2659,13 @@ impl HireSettleContract {
             panic!("dispute already resolvable without escalation");
         }
 
-        let super_arbiter: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::SuperArbiter)
-            .unwrap_or_else(|| panic!("no super arbiter configured"));
+        // Check for either single super arbiter or panel
+        let has_super_arbiter = env.storage().instance().has(&DataKey::SuperArbiter);
+        let has_panel = env.storage().instance().has(&DataKey::SuperArbiterPanel);
+
+        if !has_super_arbiter && !has_panel {
+            panic!("no super arbiter configured");
+        }
 
         env.storage().persistent().set(
             &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
@@ -2603,13 +2677,42 @@ impl HireSettleContract {
             6_300_000,
         );
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "dispute_escalated"),
-                engagement_id.clone(),
-            ),
-            (milestone_index, super_arbiter),
-        );
+        // Initialize panel vote record if using panel
+        if has_panel {
+            let panel: SuperArbiterPanel = env
+                .storage()
+                .instance()
+                .get(&DataKey::SuperArbiterPanel)
+                .unwrap();
+            env.storage().persistent().set(
+                &DataKey::EscalatedDisputeVotes(engagement_id.clone(), milestone_index),
+                &ArbiterVoteRecord {
+                    approve_votes: 0,
+                    reject_votes: 0,
+                    voted: Vec::new(&env),
+                },
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "dispute_escalated"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, panel.members.len()),
+            );
+        } else {
+            let super_arbiter: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SuperArbiter)
+                .unwrap();
+            env.events().publish(
+                (
+                    Symbol::new(&env, "dispute_escalated"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, super_arbiter),
+            );
+        }
     }
 
     /// The configured super arbiter casts a tie-breaking resolution on an
@@ -2634,11 +2737,16 @@ impl HireSettleContract {
         Self::assert_engagement_not_paused(&env, &engagement_id);
         super_arbiter.require_auth();
 
+        // Ensure single super arbiter is configured (not panel)
+        if !env.storage().instance().has(&DataKey::SuperArbiter) {
+            panic!("no super arbiter configured");
+        }
+
         let configured: Address = env
             .storage()
             .instance()
             .get(&DataKey::SuperArbiter)
-            .unwrap_or_else(|| panic!("no super arbiter configured"));
+            .unwrap();
         if super_arbiter != configured {
             panic!("{}", ERR_UNAUTHORIZED);
         }
@@ -2787,6 +2895,263 @@ impl HireSettleContract {
                 old_status,
                 MilestoneStatus::Pending,
             );
+        }
+
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+    }
+
+    /// A panel member casts a vote on an escalated dispute.
+    /// Once quorum is reached, the dispute is resolved.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not a member of the super arbiter panel.
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"milestone is not in disputed status"` — the milestone isn't `Disputed`.
+    /// - `"dispute has not been escalated"` — `escalate_dispute` has not been
+    ///   called for this milestone yet.
+    /// - `"already voted"` — the caller has already voted on this dispute.
+    pub fn cast_panel_vote(
+        env: Env,
+        voter: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        approve: bool,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        voter.require_auth();
+
+        // Get panel configuration
+        let panel: SuperArbiterPanel = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuperArbiterPanel)
+            .unwrap_or_else(|| panic!("no super arbiter panel configured"));
+
+        // Verify voter is a panel member
+        let mut is_member = false;
+        for i in 0..panel.members.len() {
+            if panel.members.get(i).unwrap() == voter {
+                is_member = true;
+                break;
+            }
+        }
+        if !is_member {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+
+        let escalated_key = DataKey::EscalatedDispute(engagement_id.clone(), milestone_index);
+        let escalated: bool = env
+            .storage()
+            .persistent()
+            .get(&escalated_key)
+            .unwrap_or(false);
+        if !escalated {
+            panic!("dispute has not been escalated");
+        }
+
+        let vote_key = DataKey::EscalatedDisputeVotes(engagement_id.clone(), milestone_index);
+        let mut record: ArbiterVoteRecord = env
+            .storage()
+            .persistent()
+            .get(&vote_key)
+            .unwrap_or(ArbiterVoteRecord {
+                approve_votes: 0,
+                reject_votes: 0,
+                voted: Vec::new(&env),
+            });
+
+        // Check for double voting
+        for i in 0..record.voted.len() {
+            if record.voted.get(i).unwrap() == voter {
+                panic!("already voted");
+            }
+        }
+
+        // Record the vote
+        record.voted.push_back(voter.clone());
+        if approve {
+            record.approve_votes += 1;
+        } else {
+            record.reject_votes += 1;
+        }
+
+        // Check if quorum is reached
+        let resolved = if record.approve_votes >= panel.quorum {
+            Some(true)
+        } else if record.reject_votes > panel.members.len() - panel.quorum {
+            Some(false)
+        } else {
+            None
+        };
+
+        if resolved.is_some() {
+            // Resolution reached - process it
+            let approve = resolved.unwrap();
+
+            if approve {
+                let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
+                engagement.released_amount += payment;
+
+                let arbiter_fee_bps: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(ConfigKey::ArbiterFee))
+                    .unwrap_or(0u32);
+                let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
+                let net_payment = payment - arbiter_fee_amount;
+
+                let token_client = token::Client::new(&env, &engagement.token);
+                if arbiter_fee_amount > 0 {
+                    // Distribute arbiter fee among panel members proportionally
+                    let fee_per_member = arbiter_fee_amount / panel.members.len() as i128;
+                    for i in 0..panel.members.len() {
+                        let member = panel.members.get(i).unwrap();
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            member,
+                            &fee_per_member,
+                        );
+                    }
+                }
+                Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+                Self::on_escrow_lifecycle_checkpoint(
+                    &env,
+                    &engagement_id,
+                    EscrowLifecycleAction::PayoutReleased,
+                    -payment,
+                    &engagement.token,
+                    &engagement.company,
+                    &engagement.recruiter,
+                );
+
+                let old_status = milestone.status.clone();
+                milestone.status = MilestoneStatus::Resolved;
+                engagement.milestones.set(milestone_index, milestone);
+
+                let all_done = (0..engagement.milestones.len()).all(|i| {
+                    let s = engagement.milestones.get(i).unwrap().status;
+                    s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
+                });
+                let old_engagement_status = engagement.status.clone();
+                if all_done {
+                    engagement.status = EngagementStatus::Completed;
+                    Self::decrement_company_active_count(&env, &engagement.company);
+                }
+
+                env.storage().persistent().remove(&vote_key);
+                env.storage().persistent().remove(&DataKey::DisputeReason(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&DataKey::ArbiterVotes(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&escalated_key);
+
+                env.events().publish(
+                    (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
+                    (milestone_index, true),
+                );
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "dispute_escalation_resolved"),
+                        engagement_id.clone(),
+                    ),
+                    (milestone_index, voter.clone(), true),
+                );
+                Self::emit_milestone_status_changed(
+                    &env,
+                    &engagement_id,
+                    milestone_index,
+                    old_status,
+                    MilestoneStatus::Resolved,
+                );
+                Self::emit_engagement_status_changed(
+                    &env,
+                    &engagement_id,
+                    old_engagement_status,
+                    engagement.status.clone(),
+                );
+            } else {
+                let old_status = milestone.status.clone();
+                milestone.status = MilestoneStatus::Pending;
+                milestone.proof_hash = String::from_str(&env, "");
+                milestone.proof_submitted_at = 0;
+                engagement.milestones.set(milestone_index, milestone);
+
+                env.storage().persistent().remove(&vote_key);
+                env.storage().persistent().remove(&DataKey::LastProofAt(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&DataKey::DisputeReason(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&DataKey::ArbiterVotes(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
+                env.storage().persistent().remove(&escalated_key);
+
+                env.events().publish(
+                    (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
+                    (milestone_index, false),
+                );
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "dispute_escalation_resolved"),
+                        engagement_id.clone(),
+                    ),
+                    (milestone_index, voter.clone(), false),
+                );
+                Self::emit_milestone_status_changed(
+                    &env,
+                    &engagement_id,
+                    milestone_index,
+                    old_status,
+                    MilestoneStatus::Pending,
+                );
+            }
+
+            // Increment resolution counter
+            let current_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SuperArbiterResolutions)
+                .unwrap_or(0u64);
+            env.storage()
+                .instance()
+                .set(&DataKey::SuperArbiterResolutions, &(current_count + 1));
+        } else {
+            // Just update the vote record
+            env.storage().persistent().set(&vote_key, &record);
         }
 
         engagement.last_activity_ledger = env.ledger().sequence();
