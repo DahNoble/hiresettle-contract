@@ -1,5 +1,9 @@
 # HireSettle — Recruitment Fee Settlement Contract
 
+[![Test Status](https://github.com/TrustHire/hiresettle-contract/actions/workflows/test.yml/badge.svg)](https://github.com/TrustHire/hiresettle-contract/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](contracts/hiresettle/Cargo.toml)
+
 A [Soroban](https://soroban.stellar.org/) smart contract deployed on Stellar for managing recruitment fee settlements through milestone-based escrow payments. Built with `#![no_std]` Rust and the Soroban SDK.
 
 ---
@@ -29,13 +33,374 @@ cd contracts/hiresettle
 cargo build
 ```
 
+### Build the Deployable WASM Artifact
+
+The command above runs on your host target and is only useful for local development and editor tooling. To produce the artifact that actually gets deployed to Stellar, build for the `wasm32v1-none` target:
+
+```bash
+rustup target add wasm32v1-none   # one-time setup
+cargo build --target wasm32v1-none --release
+```
+
+This is equivalent to the Stellar CLI invocation used in CI and the Makefile:
+
+```bash
+stellar contract build
+```
+
+The resulting WASM binary is emitted at `target/wasm32v1-none/release/hiresettle.wasm`. To optimize it for deployment:
+
+```bash
+stellar contract optimize --wasm target/wasm32v1-none/release/hiresettle.wasm
+# or simply: make optimize
+```
+
+The optimized artifact is `target/wasm32v1-none/release/hiresettle.optimized.wasm`.
+
+Because Soroban runs contracts inside the Stellar WASM VM, the contract must compile to a freestanding WASM binary with no reliance on the host OS — hence the crate is annotated `#![no_std]` and built with the `wasm32v1-none` target, which ships no standard library and no OS interface. By contrast, `cargo build` and `cargo test` (the host-target commands above) compile natively so the tests can run in a normal process with the Soroban host emulated by the SDK.
+
 ### Run the Tests
 
 ```bash
 cargo test
 ```
 
+---
+
+## Getting Started: One Engagement End-to-End
+
+This walkthrough takes a single engagement from deployment to completion on Stellar **testnet**. A company escrows 100 XLM for a hire, the recruiter proves a placement and gets paid half, and after a one-day retention window, the recruiter gets paid the rest. Finally, the company rates the recruiter.
+
+It uses four roles, each with its own key:
+
+| Role | Does |
+|---|---|
+| `admin` | Deploys and initialises the contract |
+| `company` | Funds escrow, confirms milestones, rates the recruiter |
+| `recruiter` | Submits proof for each milestone and receives payouts |
+| `arbiter` | Named on the engagement; only acts if a dispute is raised |
+
+> **Want to see the whole flow in seconds instead of a day?** The same lifecycle, with three milestones and simulated ledger time, runs as a unit test:
+> `cd contracts/hiresettle && cargo test test_full_engagement_lifecycle -- --nocapture`
+> (see `test_full_engagement_lifecycle` in [`src/test.rs`](contracts/hiresettle/src/test.rs)).
+
+### Step 0 — Build the WASM
+
+Complete [Setup & Installation](#setup--installation) first, then build the optimized artifact from `contracts/hiresettle`:
+
+```bash
+cd contracts/hiresettle
+make optimize
+```
+
+### Step 1 — Create and fund the accounts
+
+```bash
+for who in admin company recruiter arbiter; do
+  stellar keys generate "$who" --network testnet --fund
+done
+
+ADMIN=$(stellar keys address admin)
+COMPANY=$(stellar keys address company)
+RECRUITER=$(stellar keys address recruiter)
+ARBITER=$(stellar keys address arbiter)
+```
+
+Friendbot gives each account 10,000 XLM, which is plenty for the escrow and fees.
+
+### Step 2 — Deploy and initialise the contract
+
+```bash
+CONTRACT=$(stellar contract deploy \
+  --wasm target/wasm32v1-none/release/hiresettle.optimized.wasm \
+  --source admin --network testnet)
+
+stellar contract invoke --id "$CONTRACT" --source admin --network testnet \
+  -- init --admin "$ADMIN"
+```
+
+`init` sets the platform fee to 0 bps (treasury = admin) and the minimum engagement amount to `100_000` raw units. The token allowlist is off by default, so any token is accepted.
+
+### Step 3 — Pick the escrow token
+
+This walkthrough uses native XLM through its Stellar Asset Contract (7 decimals, so `1 XLM = 10_000_000`). To use testnet USDC instead, see [Create a test engagement via CLI](#create-a-test-engagement-via-cli).
+
+```bash
+TOKEN=$(stellar contract id asset --asset native --network testnet)
+```
+
+### Step 4 — Company creates the engagement and funds escrow
+
+The engagement has two milestones that must sum to 100%:
+
+| Index | Name | Kind | Pays | Becomes provable |
+|---|---|---|---|---|
+| 0 | `Candidate Placed` | `Placement` | 50% | Immediately (starts `Pending`) |
+| 1 | `1-Day Retention` | `Retention` | 50% | After 1 day (starts `Locked`) |
+
+`retention_days` holds one entry per `Retention` milestone, in order. The contract computes each retention unlock ledger as `current_ledger + days × 17_280`. For milestone 1, `prerequisites: [0]` means it cannot be confirmed before milestone 0.
+
+```bash
+stellar contract invoke --id "$CONTRACT" --source company --network testnet \
+  -- create_engagement \
+  --engagement_id "ENG-DEMO-001" \
+  --company "$COMPANY" \
+  --recruiter "$RECRUITER" \
+  --arbiter_setup "{\"arbiters\":[\"$ARBITER\"],\"quorum\":1,\"weights\":null}" \
+  --token "$TOKEN" \
+  --total_amount 1000000000 \
+  --job_title "Senior Engineer" \
+  --milestones '[
+    {"name":"Candidate Placed","payment_percent":50,"kind":"Placement",
+     "valid_after_ledger":0,"proof_hash":"","status":"Pending",
+     "proof_submitted_at":0,"replacement_paid_out":"0","prerequisites":[]},
+    {"name":"1-Day Retention","payment_percent":50,"kind":"Retention",
+     "valid_after_ledger":0,"proof_hash":"","status":"Locked",
+     "proof_submitted_at":0,"replacement_paid_out":"0","prerequisites":[0]}
+  ]' \
+  --retention_days '[1]' \
+  --config '{"metadata_hash":null,"co_recruiter":null,"recruiter_split_bps":10000,
+    "contract_pdf_hash":null,"referrer":null,"tags":null,"is_public":false,
+    "stream_duration_ledgers":null,"recruiter_bond_amount":null,
+    "bundle_id":null,"fund_from_pool":false}'
+```
+
+This call transfers 100 XLM from the company to the contract. The contract sets each milestone's `valid_after_ledger` and `status` itself, so pass `0`, `""` and the starting status shown in the command. `recruiter_split_bps: 10000` sends the whole payout to the recruiter because there is no co-recruiter.
+
+Check the result:
+
+```bash
+stellar contract invoke --id "$CONTRACT" --network testnet --source admin \
+  -- get_engagement_summary --engagement_id "ENG-DEMO-001"     # status: Active, released_amount: 0
+
+stellar contract invoke --id "$CONTRACT" --network testnet --source admin \
+  -- get_all_milestone_statuses --engagement_id "ENG-DEMO-001" # ["Pending","Locked"]
+```
+
+### Step 5 — Recruiter submits placement proof
+
+A proof is any non-empty string of up to 200 characters, usually an IPFS CID or URI pointing to the evidence (e.g. a signed offer letter). A proof hash cannot be reused on another milestone in the same engagement.
+
+```bash
+stellar contract invoke --id "$CONTRACT" --source recruiter --network testnet \
+  -- submit_proof \
+  --recruiter "$RECRUITER" \
+  --engagement_id "ENG-DEMO-001" \
+  --milestone_index 0 \
+  --proof_hash "ipfs://QmOfferLetterDemo"
+```
+
+Milestone 0 moves to `ProofSubmitted`.
+
+### Step 6 — Company confirms, and the first payment is released
+
+```bash
+stellar contract invoke --id "$CONTRACT" --source company --network testnet \
+  -- confirm_milestone \
+  --company "$COMPANY" \
+  --engagement_id "ENG-DEMO-001" \
+  --milestone_index 0
+```
+
+The contract pays `1_000_000_000 × 50 / 100 = 500_000_000` (50 XLM) to the recruiter, minus the [platform fee](#platformfee) (0 here). Milestone 0 is now `Confirmed`, and `get_escrow_balance` returns `500000000`.
+
+If the company does not respond within the confirm window (~5 days), anyone can call [`force_confirm_milestone`](#force_confirm_milestone--confirm-window-timeout-override) to pay the recruiter. If the company disagrees with the proof, it calls `raise_dispute` instead, and the arbiter votes (see [Dispute Resolution Flow](#milestone-state-machine)).
+
+### Step 7 — Wait out the retention window, then unlock
+
+Milestone 1 stays `Locked` until its unlock ledger (~17,280 ledgers, about one day). Check how long is left:
+
+```bash
+stellar contract invoke --id "$CONTRACT" --network testnet --source admin \
+  -- ledgers_until_unlock --engagement_id "ENG-DEMO-001" --milestone_index 1
+```
+
+When this returns `0`, anyone can unlock it. `unlock_milestone` is permissionless, so a keeper bot usually runs it:
+
+```bash
+stellar contract invoke --id "$CONTRACT" --source admin --network testnet \
+  -- unlock_milestone --engagement_id "ENG-DEMO-001" --milestone_index 1
+```
+
+Milestone 1 moves from `Locked` to `Pending`.
+
+### Step 8 — Retention proof and final confirmation
+
+```bash
+stellar contract invoke --id "$CONTRACT" --source recruiter --network testnet \
+  -- submit_proof \
+  --recruiter "$RECRUITER" \
+  --engagement_id "ENG-DEMO-001" \
+  --milestone_index 1 \
+  --proof_hash "ipfs://QmRetentionPayrollDemo"
+
+stellar contract invoke --id "$CONTRACT" --source company --network testnet \
+  -- confirm_milestone \
+  --company "$COMPANY" \
+  --engagement_id "ENG-DEMO-001" \
+  --milestone_index 1
+```
+
+This releases the remaining 50 XLM. All milestones are now `Confirmed`, so the engagement becomes `Completed` and emits `engagement_completed`.
+
+### Step 9 — Rate the recruiter and verify
+
+A company can rate the recruiter once per completed engagement, from 1 to 5 stars:
+
+```bash
+stellar contract invoke --id "$CONTRACT" --source company --network testnet \
+  -- rate_recruiter --company "$COMPANY" --engagement_id "ENG-DEMO-001" --stars 5
+```
+
+Verify the final state:
+
+```bash
+stellar contract invoke --id "$CONTRACT" --network testnet --source admin \
+  -- get_engagement_summary --engagement_id "ENG-DEMO-001"   # status: Completed, released_amount: 1000000000
+
+stellar contract invoke --id "$CONTRACT" --network testnet --source admin \
+  -- get_escrow_balance --engagement_id "ENG-DEMO-001"       # 0
+
+stellar contract invoke --id "$CONTRACT" --network testnet --source admin \
+  -- get_recruiter_rating --recruiter "$RECRUITER"           # {"rating_count":1,"total_stars":5}
+
+stellar contract invoke --id "$TOKEN" --network testnet --source admin \
+  -- balance --id "$RECRUITER"
+```
+
+The recruiter's XLM balance is about 100 XLM above its starting 10,000 XLM. It is slightly less than that because the recruiter paid transaction fees for its two `submit_proof` calls.
+
+### What you just did
+
+```
+create_engagement ─► submit_proof(0) ─► confirm_milestone(0) ─► [~1 day] ─► unlock_milestone(1)
+   (escrow 100)        Pending→Proof      50 XLM → recruiter                  Locked→Pending
+                                                                                   │
+rate_recruiter ◄── Completed ◄── confirm_milestone(1) ◄── submit_proof(1) ◄───────┘
+                                   50 XLM → recruiter
+```
+
+### Where to go next
+
+- **Things went wrong?** Look up `raise_dispute` / `cast_arbiter_vote`, `request_replacement`, `request_early_exit`, `cancel_engagement` and `expire_engagement` in [Which write function do I call?](#which-write-function-do-i-call).
+- **Splitting a fee between two recruiters?** Set `co_recruiter` and `recruiter_split_bps` in the config (see [Key Features](#key-features)).
+- **A call panicked?** Find the message in [Errors](#errors).
+- **Building an indexer or UI?** See [Events](#events) and [Which query do I call?](#which-query-do-i-call).
+
+---
+
 ## Overview
+
+### Module Architecture
+
+The contract is organized into focused feature modules, all re-exported from `lib.rs`. The diagram below shows the module-to-module dependency flow (coarse-grained, function-level dependencies omitted).
+
+```mermaid
+flowchart TD
+    %% Foundational layer (no internal deps)
+    constants["constants<br/>(numeric defaults)"]
+    errors["errors<br/>(panic messages)"]
+
+    %% Core types & storage keys
+    enums["enums<br/>(MilestoneStatus, EngagementStatus,<br/>DataKey, ConfigKey, ExtKey, DataKey2)"]
+    types["types<br/>(Engagement, Milestone, ArbiterVoteRecord,<br/>PlatformFee, FeeTier, ...)"]
+
+    %% Internal utilities used by all feature modules
+    helpers["helpers<br/>(storage access, auth guards,<br/>fee resolution, validation, TTL)"]
+
+    %% Feature modules (alphabetical)
+    admin["admin<br/>(init, config setters, pause, upgrade)"]
+    engagement["engagement<br/>(create, lifecycle, top-up)"]
+    milestones["milestones<br/>(unlock, proof, confirm, batch, force)"]
+    disputes["disputes<br/>(raise, vote, escalate, super-arbiter)"]
+    transfers["transfers<br/>(cosigners, role transfer)"]
+    queries["queries<br/>(read-only getters)"]
+    arbiter_pool["arbiter_pool<br/>(pool mgmt, random panel draw)"]
+    payout["payout<br/>(swap adapter, token preference)"]
+    ratings["ratings<br/>(star ratings, summaries)"]
+    bonds["bonds<br/>(collateral bonds, bundles)"]
+    features["features<br/>(pooled escrow, emergency pause, rebate)"]
+
+    %% Dependency edges
+    constants --> helpers
+    errors --> helpers
+    enums --> types
+    enums --> helpers
+    types --> helpers
+    constants --> admin
+    errors --> admin
+    helpers --> admin
+    types --> admin
+    enums --> admin
+
+    constants --> engagement
+    errors --> engagement
+    helpers --> engagement
+    types --> engagement
+    enums --> engagement
+
+    constants --> milestones
+    errors --> milestones
+    helpers --> milestones
+    types --> milestones
+    enums --> milestones
+
+    errors --> disputes
+    helpers --> disputes
+    types --> disputes
+    enums --> disputes
+
+    helpers --> transfers
+    types --> transfers
+    enums --> transfers
+
+    helpers --> queries
+    types --> queries
+    enums --> queries
+
+    constants --> arbiter_pool
+    helpers --> arbiter_pool
+    types --> arbiter_pool
+    enums --> arbiter_pool
+
+    types --> payout
+    enums --> payout
+
+    helpers --> ratings
+    types --> ratings
+    enums --> ratings
+
+    helpers --> bonds
+    types --> bonds
+    enums --> bonds
+
+    constants --> features
+    helpers --> features
+    types --> features
+    enums --> features
+
+    %% Styling
+    classDef foundational fill:#f5f5f5,stroke:#999,stroke-width:1px;
+    classDef core fill:#e8f4fd,stroke:#2196f3,stroke-width:2px;
+    classDef internal fill:#fff3e0,stroke:#ff9800,stroke-width:2px;
+    classDef feature fill:#e8f5e9,stroke:#4caf50,stroke-width:1px;
+
+    class constants,errors foundational;
+    class enums,types core;
+    class helpers internal;
+    class admin,engagement,milestones,disputes,transfers,queries,arbiter_pool,payout,ratings,bonds,features feature;
+```
+
+## Glossary
+
+- **Engagement**: An agreement or project contract initiated between parties on the platform.
+- **Milestone**: A specific checkpoint or deliverable within an engagement that triggers payouts upon approval.
+- **Retention**: Funds held in escrow until all engagement conditions or warranty periods are satisfied.
+- **Cosigner**: An authorized third party required to sign or approve specific actions or state transitions.
+- **Super-arbiter**: A high-level administrative entity with authority to resolve escalations and dispute deadlocks.
+- **Quorum**: The minimum threshold of votes or signatures required to execute a governance or arbitration action.
+- **Amendment**: A formal modification proposed and agreed upon to update the terms of an active engagement.
+
 
 HireSettle governs the relationship between a **hiring company** and a **recruiter** by locking the total agreed fee in an escrow wallet at engagement creation. As the recruiter delivers on each milestone (placement, 30-day retention, 90-day retention, etc.), the company confirms the deliverable, releasing a proportional payment from escrow. If disputes arise, an M-of-N arbiter panel votes to resolve them. The contract handles the entire lifecycle: creation, proof submission, confirmation, dispute, replacement, early exit, cancellation, and expiry.
 
@@ -118,6 +483,7 @@ Each milestone transitions through the following states. For `Retention` milesto
 | **Contract PDF attestation** | Optional `contract_pdf_hash` (e.g. SHA-256 of the signed PDF) stored at creation for audit trail. |
 | **Engagement listing** | Per-company paginated engagement ID list (issue #35) and global engagement counter (issue #34). |
 | **Unlock progress query** | `get_unlock_progress()` returns `(unlocked_count, total)` — how many milestones are past `Locked` status. |
+| **Cosigners** | A company or recruiter can register a secondary [cosigner](#cosigners) address equally authorized to act on its behalf, without sharing the primary key. |
 
 ---
 
@@ -139,9 +505,14 @@ The full on-chain record:
 Passed at creation to stay within Soroban's 10-parameter limit:
 - `metadata_hash` (Option<String>), `contract_pdf_hash` (Option<String>)
 - `co_recruiter` (Option<Address>), `recruiter_split_bps` (u32)
+- `is_public` (bool) — opt the engagement into `get_public_engagement_ids`. Set once at creation and cannot be changed afterwards. See [Engagement visibility](#engagement-visibility).
+- `pull_payouts` (bool) — credit payouts to a claimable balance instead of transferring them. Default `false`. See [Pull payouts](#pull-payouts-547).
+- `require_recruiter_acceptance` (bool) — create the engagement as an `Offered` offer the recruiter must accept. Default `false`. See [Recruiter acceptance](#recruiter-acceptance-569).
 
 ### `EngagementStatus`
 `Active` → `Completed` | `Cancelled` | `Expired` | `ReplacementRequested` | `ExitRequested`
+
+`Offered` → `Active` (recruiter accepts) | `Cancelled` (company withdraws) | `Expired`. Only engagements created with `require_recruiter_acceptance` start as `Offered`.
 
 ### `EngagementSummary`
 
@@ -299,8 +670,92 @@ gross_share = total_amount × payment_percent ÷ 100
 fee_amount = gross_share × platform_fee_bps ÷ 10_000
 net_payment = gross_share − fee_amount // this is what the recruiter actually receives
 
-`fee_amount` is transferred to `treasury`; a `platform_fee_collected` event `(milestone_index, fee_amount, treasury)` is emitted whenever `fee_amount > 0` (no event when the fee is 0). Disputes resolved via `cast_arbiter_vote` do **not** deduct the platform fee — they deduct a separate, arbiter-only fee instead (see `set_arbiter_fee`).
+`fee_amount` is transferred to `treasury`; a `platform_fee_collected` event `(milestone_index, fee_amount, treasury)` is emitted whenever `fee_amount > 0` (no event when the fee is 0). Approved disputes (`cast_arbiter_vote`, `cast_arbiter_split_vote`, `super_arbiter_resolve`) also deduct the platform fee, then take the arbiter fee from what is left (see `set_arbiter_fee`). Every payout path resolves the rate the same way; see [Which fee reductions apply on each payout path](#which-fee-reductions-apply-on-each-payout-path). When [multiple treasuries](#multiple-treasuries-540) are configured, the fee is split across them instead and one `platform_fee_collected` event is emitted per treasury.
 
+When fee tiers are configured, `platform_fee_bps` in the formula above is the **resolved** rate for that engagement's `total_amount` (see [Fee tiers](#fee-tiers)), not necessarily the base `PlatformFee.bps` returned by `get_platform_fee()`.
+
+### Fee tiers
+
+Admin can scale the platform fee down for larger engagements instead of charging every size the same flat `bps`. Each bracket is a `FeeTier`. Tiers are optional: an empty list means the base `PlatformFee.bps` applies to every engagement.
+
+#### Configuration
+- **Set Tiers**: `set_fee_tiers(admin, tiers)` — admin only. Replaces the entire list. Pass an empty vector to clear all tiers (back to a flat fee). Emits `fee_tiers_set` with payload `tiers.len()`.
+- **Read Tiers**: `get_fee_tiers()` — returns `Vec<FeeTier>`. Permissionless. Empty vector = no tiering.
+- **Default**: no tiers stored. `get_platform_fee()` still returns the base `(bps, treasury)` even when tiers are set; it does not return the resolved rate for a given amount.
+
+```rust
+pub struct FeeTier {
+    pub threshold: i128,             // inclusive min engagement.total_amount
+    pub bps: u32,                    // platform fee for this bracket (basis points)
+}
+```
+
+#### How a tier is selected
+
+At fee-calculation time the contract walks the stored list from **highest `threshold` to lowest** and uses the first tier whose `threshold` is `<= engagement.total_amount`. If no tier matches, the base `PlatformFee.bps` applies.
+
+Example with base fee `200` bps and two tiers `(10_000_000, 150)` then `(100_000_000, 100)`:
+
+| `total_amount` | Rate used |
+|---|---|
+| `5_000_000` | `200` (below every threshold → base) |
+| `10_000_000` | `150` |
+| `100_000_000` | `100` (highest matching threshold wins) |
+
+#### Validation
+
+`set_fee_tiers` panics unless all of the following hold:
+
+| Rule | Panic |
+|---|---|
+| At most 10 tiers | `too many fee tiers` |
+| Each `bps` ≤ current base `PlatformFee.bps` | `tier bps exceeds base platform fee` |
+| Each `threshold` > 0 | `tier threshold must be positive` |
+| Thresholds strictly ascending | `tiers must be sorted by ascending threshold` |
+
+The 500 bps `FeeTooHigh` cap is enforced on `set_platform_fee`, not here. A tier cannot charge **more** than the current base fee (tiers are discounts for larger size, not surcharges). Caller must also be admin and the contract must not be paused (`ContractPaused`, `NoAdmin`, `unauthorized`).
+
+#### Snapshot mode (#505)
+
+By default an engagement's tier is re-resolved against the live tier list at every payout, so a later `set_fee_tiers` call changes the rate of engagements already in flight. Setting `EngagementConfig::snapshot_fee_tier = true` resolves the tier once in `create_engagement` and reuses it for every later payout on that engagement. When no tier matches, the base rate at creation is frozen instead.
+
+Only the tier lookup is frozen. At payout time a fee waiver still zeroes the fee, and the live referral discount is still subtracted from the frozen rate. `get_fee_tier_snapshot(engagement_id)` returns the frozen bps, or `None` for engagements that track the live tiers. The snapshot is not re-resolved when `top_up_escrow` grows `total_amount`.
+
+### Referral discount
+
+Engagements may carry an optional `referrer` address (set at creation via
+`Engagement` / `EngagementConfig`). That field alone does not change fees.
+
+Admin setup:
+
+- `add_referrer` / `remove_referrer` / `get_referrers` — maintain the recognised
+  referrer list stored under `DataKey::Referrers`.
+- `set_referral_discount_bps(admin, bps)` / `get_referral_discount_bps()` —
+  configure how many basis points to subtract from the platform fee when the
+  engagement’s `referrer` is on that list (max 500 bps, same cap as the platform
+  fee). Default discount is `0`.
+
+On every payout path the contract computes an **effective** platform-fee
+rate as follows. An admin [fee waiver](#fee-waiver) overrides all of them.
+
+1. Start from the base rate: the [company override](#per-company-fee-override-539)
+   if one is set, otherwise the per-token override (or the global platform fee
+   `bps`) run through the matching **fee tier** when `set_fee_tiers` is in use —
+   larger `total_amount` can qualify for a lower tier `bps`.
+2. If `engagement.referrer` is `Some(addr)` **and** `addr` is in the recognised
+   referrer list, subtract `referral_discount_bps` from that rate.
+3. Floor at `0` (the platform fee never goes negative).
+
+Then:
+
+```text
+fee_amount  = payment × effective_bps ÷ 10_000
+net_payment = payment − fee_amount 
+```
+If there is no referrer, the referrer is not on the list, or the discount is `0`, the effective rate is unchanged from the base / tier rate.
+
+Referral discount applies only to the **platform** fee path above. Arbiter fees from dispute resolution 
+(`cast_arbiter_vote` / `set_arbiter_fee`) are separate and are not reduced by the referral discount.
 
 ```rust
 pub struct PlatformFee {
@@ -309,27 +764,204 @@ pub struct PlatformFee {
 }
 ```
 
-### `DataKey`
+### Fee waiver
+
+The admin can switch off the platform fee for a single engagement, for example a promotional or goodwill placement, without changing the contract-wide fee.
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `waive_platform_fee(admin, engagement_id)` | Admin | Waive the platform fee for every **future** payout on this engagement. | `NoAdmin`, `unauthorized`, `engagement not found` |
+| `is_fee_waived(engagement_id)` → `bool` | Anyone | Return `true` if a waiver has been recorded. Unknown IDs return `false` instead of panicking. | — |
+
+Behaviour:
+
+- **It overrides every other fee setting.** While a waiver is in place the effective platform-fee rate is `0`, whatever the base `PlatformFee.bps`, the matching fee tier or the referral discount. This applies on every path that pays out a milestone: `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `cast_arbiter_vote`, `cast_arbiter_split_vote`, `super_arbiter_resolve` and `resolve_escalation_timeout`.
+- **Only the platform fee is waived.** On an approved dispute the arbiter fee (`set_arbiter_fee`) is still deducted, now from the full gross share.
+- **No rebate activity.** With a fee of `0`, `collect_platform_fee` never runs, so the company's fee-rebate balance (`set_fee_rebate_bps` / `redeem_company_rebate`) is neither drawn down nor credited for waived payouts.
+- **It is not retroactive.** Fees already sent to the treasury before the waiver are not refunded.
+- **It is permanent.** No function removes a waiver. To charge fees again you would need a new engagement.
+- **It is idempotent.** Waiving an engagement that is already waived changes no state, but it emits the event again and refreshes the entry's TTL.
+- **It is not blocked by the global pause.** The function only checks admin authority, so it works while the contract is paused. It works on an engagement in any status.
+
+Storage: `DataKey::FeeWaived(engagement_id)` → `true`, persistent, TTL extended to `6_300_000` ledgers on each call.
+
+Event: `("platform_fee_waived", engagement_id)` with data `(admin,)`.
 
 ```rust
-pub enum DataKey {
-    Engagement(String),              // full engagement record by ID (persistent)
-    Admin,                           // current admin address (instance)
-    PendingArbiter(String),          // pending arbiter succession nomination
-    PlatformFee,                     // bps + treasury config (persistent)
-    Paused,                          // pause-guard bool (persistent)
-    PendingAdmin,                    // nominated admin successor (persistent)
-    ProofCooldown,                   // min ledgers between resubmissions (instance)
-    LastProofAt(String, u32),        // ledger of last proof submission
-    ArbiterVotes(String, u32),       // running vote tally for a dispute
-    AmendmentProposal(String, u32),  // active amendment proposal
-    AmendmentLog(String, u32),       // amendment history entries
-    AmendmentTTL,                    // proposal expiry duration (persistent)
-    // … additional keys for counts, allowlist, timeouts, etc.
-}
+// Admin waives the fee; later confirmations pay the recruiter the full gross share.
+client.waive_platform_fee(&admin, &engagement_id);
+assert!(client.is_fee_waived(&engagement_id));
 ```
 
-Contract storage key space enumerating all persistent and instance-stored values. Instance keys reset between transactions; persistent keys survive across ledgers.
+### Per-company fee override (#539)
+
+The admin can give one company a negotiated base rate that applies to every engagement it owns, on every payout path (`confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, and every dispute resolution).
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `set_company_platform_fee(admin, company, bps)` | Admin | Set the company's base rate. Same 500 bps cap as `set_platform_fee`. | `ContractPaused`, `NoAdmin`, `unauthorized`, `FeeTooHigh` |
+| `remove_company_platform_fee(admin, company)` | Admin | Remove the override; the company falls back to the token / tier / global resolution. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_company_platform_fee(company)` → `Option<u32>` | Anyone | Return the override, if any. | — |
+
+Base-rate precedence, highest first:
+
+1. Engagement [fee waiver](#fee-waiver) — the fee is `0`.
+2. Company override.
+3. Per-token override (`set_token_platform_fee`) run through the fee tiers (live, or the [snapshot](#snapshot-mode-505)). As before, a matching tier replaces the token base.
+4. Global `PlatformFee.bps` run through the fee tiers.
+
+The company override also replaces a tier snapshot. The referral discount, the fee floor and the rebate still apply on top. The override follows the engagement's current `company`, so after `transfer_company` the new company's override applies.
+
+Events: `("company_platform_fee_set",)` with `(company, bps)`; `("company_platform_fee_removed",)` with `company`.
+
+### Multiple treasuries (#540)
+
+By default every fee goes to `PlatformFee.treasury`. The admin can instead split fees across several weighted treasuries, for example an operations wallet, an insurance fund and a grants pool.
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `set_fee_treasuries(admin, treasuries)` | Admin | Replace the list with `Vec<(Address, u32)>` of `(treasury, weight_bps)`. At most 10 entries, no zero weights, no duplicate addresses, weights summing to exactly 10 000. | `ContractPaused`, `NoAdmin`, `unauthorized`, `EmptyTreasuryList`, `TooManyTreasuries`, `InvalidTreasuryWeight`, `DuplicateTreasury`, `TreasuryWeightsMustSumTo10000` |
+| `clear_fee_treasuries(admin)` | Admin | Remove the list; fees go to `PlatformFee.treasury` again. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_fee_treasuries()` → `Vec<(Address, u32)>` | Anyone | Return the list; empty when unset. | — |
+
+The amount owed to the treasury (after any fee rebate credit from `set_fee_rebate_bps`) is split like this:
+
+```text
+share_i (i ≥ 1) = amount × weight_i ÷ 10_000        (rounded down)
+share_0         = amount − Σ share_i                (the first treasury gets the dust)
+```
+
+So the shares always add up to the full fee. While a list is set, `PlatformFee.treasury` receives nothing unless it is in the list, and `get_platform_fee()` still returns it unchanged.
+
+Events: one `("platform_fee_collected", engagement_id)` per treasury, in list order, with `(milestone_index, share, treasury)`. `share` is what that treasury received. With no list set, the single event still reports `(milestone_index, fee_amount, treasury)` as before. `set_fee_treasuries` emits `("fee_treasuries_set",)` with the list; `clear_fee_treasuries` emits `("fee_treasuries_cleared",)`.
+
+### `DataKey`
+
+Contract storage is keyed by three `#[contracttype]` enums, all defined in
+`contracts/hiresettle/src/enums.rs`. Soroban caps a contract-type union at 50
+variants, so `DataKey` holds the original keys, admin-tunable scalars are
+nested under `DataKey::Config(ConfigKey)`, and newer features use `DataKey2`.
+
+"Instance" keys live in the contract instance entry and share its TTL.
+"Persistent" keys are separate ledger entries, each with its own TTL.
+
+#### `DataKey` (43 variants)
+
+| Variant | Storage | Holds |
+|---|---|---|
+| `Engagement(engagement_id)` | Persistent | Full `Engagement` record |
+| `Admin` | Instance | Current admin address |
+| `PendingArbiter(engagement_id)` | Persistent | Pending arbiter succession nomination |
+| `PlatformFee` | Persistent | Base platform fee: bps and treasury |
+| `Paused` | Persistent | Global pause flag |
+| `PendingAdmin` | Persistent | Nominated admin successor |
+| `ProposedRecruiterTransfer(engagement_id)` | Persistent | Proposed new recruiter awaiting company acceptance (#44) |
+| `LastProofAt(engagement_id, milestone_index)` | Persistent | Ledger of the last proof submission, for the resubmission cooldown |
+| `ArbiterVotes(engagement_id, milestone_index)` | Persistent | Running arbiter vote tally for a dispute |
+| `EngagementCount` | Instance | Total engagements ever created (#34) |
+| `CompanyEngagements(company)` | Persistent | Company's engagement IDs, in creation order (#35) |
+| `RecruiterEngagements(recruiter)` | Persistent | Recruiter's engagement IDs, in creation order (#36) |
+| `AllowedTokens` | Persistent | Token allowlist (#26) |
+| `AllowlistEnabled` | Persistent | Whether the token allowlist is enforced (#26) |
+| `DisputeReason(engagement_id, milestone_index)` | Persistent | Dispute reason string (#50) |
+| `ReplacementReason(engagement_id, replacement_index)` | Persistent | Reason code for a replacement request, indexed from 0 (#51) |
+| `ReplacementCount(engagement_id)` | Persistent | Replacements requested so far; the next `replacement_index` (#51) |
+| `Version` | Persistent | Contract version label (#16) |
+| `PendingUpgrade` | Instance | Pending WASM upgrade proposal (#69) |
+| `AdminRenounced` | Instance | Set once the admin role has been permanently renounced (#59) |
+| `CompanyActiveCount(company)` | Persistent | Company's currently active (non-terminal) engagements |
+| `CompanyCosigner(company)` | Persistent | Cosigner allowed to act for the company (#254) |
+| `RecruiterCosigner(recruiter)` | Persistent | Cosigner allowed to act for the recruiter (#257) |
+| `FeeTiers` | Persistent | `Vec<FeeTier>` size-based fee brackets (#250) |
+| `SuperArbiter` | Instance | Super-arbiter address for escalated disputes (#246) |
+| `DisputeRaisedAt(engagement_id, milestone_index)` | Persistent | Ledger the dispute was raised, for the dispute window (#246) |
+| `EscalatedDispute(engagement_id, milestone_index)` | Persistent | Whether the dispute was escalated to the super-arbiter (#246) |
+| `TagEngagements(tag)` | Persistent | Engagement IDs carrying a tag (#248, #249) |
+| `DueSoonNotified(engagement_id, milestone_index)` | — | Declared for the once-only `milestone_due_soon` event (#241); not currently read or written |
+| `EngagementPaused(engagement_id)` | Persistent | Per-engagement quarantine flag, independent of `Paused` (#239) |
+| `EngagementPauseReason(engagement_id)` | Persistent | Last reason given to `pause_engagement`; kept after unpause (#327) |
+| `AllEngagements` | Persistent | Every engagement ID ever created; backs `get_engagement_ids_by_status` (#237) |
+| `Referrers` | Persistent | Recognised referrer addresses (#251) |
+| `Config(ConfigKey)` | Instance or persistent | One admin-tunable scalar; see [`ConfigKey`](#configkey-20-variants) |
+| `EscalatedAt(engagement_id, milestone_index)` | Persistent | Ledger of escalation, for the super-arbiter response deadline (#318) |
+| `SuperArbiterResolutionCount` | Instance | Disputes concluded through super-arbiter escalation (#317) |
+| `FeeWaived(engagement_id)` | Persistent | Platform fee waived for this engagement (#335) |
+| `MilestonePendingSince(engagement_id, milestone_index)` | Persistent | Ledger a placement milestone last re-entered `Pending`; absent means since creation (#465) |
+| `NoShowForfeited(engagement_id)` | Persistent | Shares forfeited by `trigger_no_show` and not yet refunded (#465) |
+| `StreamedPayout(engagement_id, milestone_index)` | Persistent | Vesting record for a streamed milestone payout (#466) |
+| `ArbiterPool` | Persistent | Admin-curated pool for random arbiter panels (#467) |
+| `ArbiterStats(arbiter)` | Persistent | Arbiter dispute-response history (#468) |
+| `Ext(ExtKey)` | — | Reserved nested key space; `ExtKey` is declared but not currently used |
+
+#### `ConfigKey` (20 variants)
+
+Each variant is stored as `DataKey::Config(ConfigKey::…)`.
+
+| Variant | Storage | Holds |
+|---|---|---|
+| `ProofCooldown` | Instance | Ledgers between proof resubmissions (default 2 880) |
+| `LedgersPerDay` | Instance | Ledgers-per-day constant (#41) |
+| `ConfirmWindow` | Instance | Confirm window in ledgers (default 86 400) |
+| `DisputeWindow` | Instance | Dispute window in ledgers (default 51 840) |
+| `MinEngagementAmount` | Persistent | Minimum engagement amount in raw token units (#17) |
+| `UpgradeLockDuration` | Instance | Upgrade time-lock in ledgers (default 17 280, #69) |
+| `MaxProofHashLength` | Instance | Max proof hash length in characters (default 200, #68) |
+| `ArbiterFee` | Instance | Arbiter fee in bps, max 200 (#52) |
+| `MaxActivePerCompany` | Instance | Max simultaneous active engagements per company (default 50) |
+| `MaxReplacements` | Instance | Max replacements per engagement (default 3, #31) |
+| `ReferralDiscountBps` | Persistent | Referral discount in bps (#251) |
+| `SuperArbiterResponseWindow` | Instance | Super-arbiter deadline before auto-resolving for the recruiter (#318) |
+| `TokenMinAmounts` | Persistent | `Map<Address, i128>` of per-token minimum amounts (#366) |
+| `NoShowDeadline` | Instance | Recruiter no-show deadline in ledgers; `0` disables it (#465) |
+| `SwapAdapter` | Instance | Trusted swap adapter for payout-token conversion (#458) |
+| `ProofCooldownDiscount` | Instance | Rating-based proof cooldown discount curve (#470) |
+| `BondForfeitBps` | Instance | Share of a recruiter bond forfeited on unresolved rejections (default 10 000, #459) |
+| `AmendmentTTL` | Instance | Amendment proposal TTL in ledgers (default 17 280) |
+| `FeeRebateBps` | Persistent | Share of each platform fee credited as a company rebate (#475) |
+| `EmergencyVoteWindow` | Persistent | Emergency pause vote window in ledgers (#474) |
+| `ArbiterVoteDeadline` | Instance | Ledgers after a dispute is raised before non-voting arbiters can be recused; `0` disables it (#560) |
+
+#### `DataKey2` (25 variants)
+
+All `DataKey2` entries are persistent.
+
+| Variant | Holds |
+|---|---|
+| `ArbiterSplitVotes(engagement_id, milestone_index)` | Split-vote tally for a dispute (#462) |
+| `SplitVotingEnabled(engagement_id)` | Whether split voting is on (#462) |
+| `SplitWithheld(engagement_id)` | Share withheld by split-vote resolutions, pending refund (#462) |
+| `ArbiterVoteDelegate(engagement_id, arbiter)` | Vote delegate for an arbiter slot (#463) |
+| `RecruiterPayoutToken(recruiter)` | Recruiter's preferred payout token (#458) |
+| `DisputeWindowProposal(engagement_id)` | Pending dispute-window override proposal (#469) |
+| `DisputeWindowOverride(engagement_id)` | Accepted dispute-window override in ledgers (#469) |
+| `EngagementRated(engagement_id)` | Set once the company has rated the recruiter (#470) |
+| `RecruiterRating(recruiter)` | Aggregated star ratings (#470) |
+| `RecruiterBond(engagement_id)` | Recruiter collateral bond (#459) |
+| `Bundle(bundle_id)` | Shared arbiter panel for a bundle (#464) |
+| `BundleEngagements(bundle_id)` | Engagement IDs in a bundle, in creation order (#464) |
+| `RecruiterVerified(recruiter)` | Admin-set verification badge; absent means `false` (#476) |
+| `SplitAmendmentProposal(engagement_id)` | Pending co-recruiter split amendment (#471) |
+| `SplitAmendmentLog(engagement_id)` | Accepted co-recruiter split amendments (#471) |
+| `RecusedArbiters(engagement_id, milestone_index)` | Arbiters who recused from a dispute (#477) |
+| `CompanyBalance(company, token)` | Pooled escrow balance (#472) |
+| `PoolFunded(engagement_id)` | Whether the engagement was funded from the pool (#472) |
+| `ConfigCosigner` | Second signer for sensitive admin setters (#473) |
+| `SensitiveFunctions` | Setter function IDs that need the config cosigner (#473) |
+| `PendingConfigChange(change_id)` | Pending cosigner-gated config change (#473) |
+| `NextConfigChangeId` | Counter for pending config change IDs (#473) |
+| `EmergencySigners` | Emergency M-of-N signer set and threshold (#474) |
+| `EmergencyVotes(engagement_id)` | Emergency pause vote tally; empty string means a global pause (#474) |
+| `CompanyRebate(company, token)` | Redeemable fee rebate balance (#475) |
+| `ReplacementRecord(engagement_id, replacement_index)` | Who requested a replacement and at which ledger (#501) |
+| `DisputeHistory(engagement_id)` | Every dispute raised, kept after resolution; last 50 (#501) |
+| `StatusHistory(engagement_id)` | Every engagement status transition; last 50 (#501) |
+| `FeeTierSnapshot(engagement_id)` | Fee bps frozen at creation for `snapshot_fee_tier` engagements (#505) |
+| `CoRecruiterBond(engagement_id)` | Co-recruiter collateral bond (#506) |
+| `RecruiterClaimable(recipient, token)` | Payouts credited by `pull_payouts` engagements, not yet claimed (#547) |
+| `PullPayouts(engagement_id)` | Whether the engagement credits payouts instead of pushing them (#547) |
+| `FeeTreasuries` | Weighted fee treasuries `Vec<(Address, u32)>` (#540) |
+| `CompanyPlatformFee(company)` | Per-company base platform-fee override (#539) |
+| `VoteDeadlineEnforced(engagement_id, milestone_index)` | Set when `enforce_vote_deadline` left a dispute undecided, so it can be escalated without waiting out the dispute window (#560) |
 
 ---
 
@@ -360,6 +992,24 @@ Either the company or the recruiter may propose a change to a milestone's `payme
 
 ### TTL and Expiry
 
+The contract exposes several admin-configurable time-based constants (TTLs, windows, and durations). The table below lists every such constant, its default value, and the setter/getter pair used to manage it. All values are denominated in **ledgers** (≈ 5 s each) unless otherwise noted.
+
+| Constant | Default (ledgers) | Approx. Duration | Setter | Getter |
+|---|---|---|---|---|
+| `storage_ttl_extend_to` | 1,036,800 | ~60 days | `set_storage_ttl_extend_to(admin, ledgers)` | `get_storage_ttl_extend_to()` |
+| `confirm_window` | 86,400 | ~5 days | `set_confirm_window(admin, ledgers)` | `get_confirm_window()` |
+| `dispute_window` | 51,840 | ~3 days | `set_dispute_window(admin, ledgers)` | `get_dispute_window()` |
+| `amendment_ttl` | 17,280 | ~1 day | `set_amendment_ttl(admin, ledgers)` | `get_amendment_ttl()` |
+| `extension_ttl` | 17,280 | ~1 day | `set_extension_ttl(admin, ledgers)` | `get_extension_ttl()` |
+| `upgrade_lock_duration` | 17,280 | ~1 day | `set_upgrade_lock_duration(admin, ledgers)` | `get_upgrade_lock_duration()` |
+| `inactivity_timeout` | 1,036,800 | ~60 days | `set_inactivity_timeout_ledgers(admin, ledgers)` | `get_inactivity_timeout_ledgers()` |
+| `due_soon_window` | 17,280 | ~1 day | `set_due_soon_window(admin, ledgers)` | `get_due_soon_window()` |
+| `proof_cooldown` | 2,880 | ~4 hours | `set_proof_cooldown(admin, ledgers)` | `get_config_snapshot().proof_cooldown_ledgers` |
+| `super_arbiter_response_window` | 51,840 | ~3 days | `set_super_arbiter_deadline(admin, ledgers)` | `get_super_arbiter_deadline()` |
+| `ledgers_per_day` | 17,280 | 1 day | `set_ledgers_per_day(admin, value)` | `get_ledgers_per_day()` |
+
+> **Tip:** `get_config_snapshot()` returns **all** of the above values in a single read-only call, so off-chain indexers do not need ~11 separate round-trips to reconstruct the current configuration.
+
 Every proposal carries an expiry ledger computed as `proposed_at_ledger + amendment_ttl` (see [`AmendmentProposal.expires_at_ledger`](#amendmentproposal)).
 
 - The default TTL is **17,280 ledgers** (≈ 1 day at 5 s/ledger).
@@ -371,19 +1021,29 @@ Every proposal carries an expiry ledger computed as `proposed_at_ledger + amendm
 
 ### Withdrawing a Proposal
 
-`accept_amendment` and `reject_amendment` are both restricted to the
-counterparty, so before issue #238 a proposer who changed their mind had to wait
-out the TTL. `withdraw_amendment_proposal(proposer, engagement_id,
-milestone_index)` lets the **original proposer** clear their own pending proposal
-immediately.
+`accept_amendment` and `reject_amendment` are restricted to the counterparty.
+The original proposer can instead clear their own pending proposal immediately:
 
-Only the address recorded on the proposal may withdraw it — being the
-engagement's company or recruiter is not sufficient. Afterwards
-`get_pending_amendment` reports `None` and a fresh proposal can be made for the
-same milestone. The amendment log is untouched: a withdrawn proposal was never
-applied, so it is not part of the milestone's amendment history. An
-expired-but-uncleared proposal can still be withdrawn, since that is exactly the
-storage cleanup the caller intends.
+```rust
+withdraw_amendment_proposal(proposer, engagement_id, milestone_index)
+```
+
+The function applies these checks in order:
+
+1. `proposer` must authorize the transaction.
+2. A proposal must exist for the specified `engagement_id` and
+   `milestone_index`; otherwise it panics with `no pending amendment proposal`.
+3. `proposer` must match the proposal's recorded proposer; otherwise it panics
+   with `unauthorized`.
+
+It does not perform a separate engagement lookup, so merely being the
+engagement's company or recruiter is not sufficient. On success, the proposal
+is removed and an `amendment_withdrawn` event is emitted with
+`(milestone_index, proposer, new_payment_percent)`. The milestone's amendment
+log is unchanged because the proposal was never applied. An
+expired-but-uncleared proposal can also be withdrawn to remove its stored entry.
+After withdrawal, `get_pending_amendment` returns `None` and a fresh proposal can
+be made for the same milestone.
 
 ### What an Amendment Can Change
 
@@ -402,6 +1062,134 @@ Each time an amendment is accepted, an [`AmendmentEntry`](#amendmententry) is ap
 - Accessible via `get_amendment_log(engagement_id, milestone_index)` which returns entries in chronological order (oldest first).
 - The log is **FIFO-capped at 20 entries per milestone** — once the cap is reached, the oldest entry is evicted on the next accepted amendment.
 - The pending proposal itself is not part of the log until it is accepted; use `get_pending_amendment` to inspect a live proposal.
+
+---
+
+## Milestone Extension Requests
+
+A retention milestone unlocks automatically once `valid_after_ledger` passes. A **milestone extension request** lets the recruiter ask the company for more time before that deadline arrives, without touching `payment_percent` the way an [amendment](#amendments) does.
+
+### Extension Propose → Accept / Reject Flow
+
+1. **Propose** — `propose_milestone_extension(recruiter, engagement_id, milestone_index, additional_ledgers)`
+   - Caller must be the engagement's `recruiter` (or its registered [cosigner](#cosigners)); must sign the transaction. Unlike amendments, this is **one-directional** — only the recruiter may propose.
+   - The engagement must be `Active`, and the target milestone must be a `Retention` milestone currently `Locked`. Placement milestones, and milestones that have progressed past `Locked`, cannot be extended.
+   - `additional_ledgers` must be greater than zero.
+   - Panics with `MilestoneExtensionLimitReached` once the milestone has already been granted the admin-configured maximum number of extensions (default 3, via `get_max_milestone_extensions()`).
+   - A new proposal overwrites any existing pending proposal for the same milestone (only one pending per milestone at a time).
+   - Emits a `milestone_extension_proposed` event.
+   - The pending state is stored as a `MilestoneExtensionProposal` struct under `DataKey::MilestoneExtensionProposal(engagement_id, milestone_index)`.
+
+2. **Accept** — `accept_milestone_extension(company, engagement_id, milestone_index)`
+   - Caller must be the engagement's `company` (or its cosigner).
+   - `additional_ledgers` is added to the milestone's `valid_after_ledger` immediately, pushing its unlock deadline further out.
+   - Clears any `milestone_due_soon` notification flag for the milestone, since the deadline it referred to has moved — the new deadline can be announced again in its own right.
+   - Increments the per-milestone granted-extension count used by the cap above and by `get_milestone_extension_count`.
+   - Emits a `milestone_extension_accepted` event.
+
+3. **Reject** — `reject_milestone_extension(company, engagement_id, milestone_index)`
+   - Caller must be the engagement's `company` (or its cosigner).
+   - The pending proposal is cleared from storage without any change to the milestone.
+   - Emits a `milestone_extension_rejected` event with reason `declined`.
+
+Use `get_pending_milestone_extension(engagement_id, milestone_index)` → `Option<MilestoneExtensionProposal>` to inspect a live proposal — mirrors `get_pending_amendment`.
+
+### Extension TTL and Expiry
+
+Each proposal carries an expiry ledger computed as `proposed_at_ledger + extension_ttl` (see the `extension_ttl` row in the [Amendments TTL table](#ttl-and-expiry) — default **17,280 ledgers**, ≈ 1 day).
+
+- Admin can change the default globally via `set_extension_ttl(admin, ledgers)`; the current value is queried with `get_extension_ttl()`.
+- If the current ledger exceeds `expires_at_ledger`, the proposal is considered *expired*:
+  - Calling `accept_milestone_extension` on an expired proposal clears it, emits a `milestone_extension_rejected` event with reason `expired`, and panics with `milestone_extension_expired`.
+  - `get_pending_milestone_extension` automatically treats expired proposals as non-existent and returns `None`.
+- Expired proposals are lazily cleared — either by a later `accept_milestone_extension` call on them, or overwritten by the next `propose_milestone_extension` for the same milestone.
+
+### How This Differs From a Milestone Amendment
+
+| | Amendment | Milestone Extension |
+|---|---|---|
+| Changes | `payment_percent` | `valid_after_ledger` (unlock deadline) |
+| Applies to | Any milestone | `Retention` milestones only, while `Locked` |
+| Who may propose | Company **or** recruiter | Recruiter only |
+| Who accepts/rejects | The other party | Company only |
+| Repeat limit | None (20-entry history log, no proposal cap) | Capped at `get_max_milestone_extensions()` grants per milestone (default 3) |
+| TTL constant | `amendment_ttl` | `extension_ttl` |
+
+---
+
+## Engagement Timeline
+
+`get_engagement_timeline(engagement_id, page, page_size)` returns one page of everything that happened on an engagement, oldest first, as `TimelineEntry { kind, milestone_index, actor, ledger, source_index }` (#501). It is merged at read time from the per-kind histories, so it always agrees with them:
+
+| `kind` | Source | `milestone_index` | `actor` |
+|---|---|---|---|
+| `Amendment` | `get_split_amendment_log` | `None` | Proposer |
+| `Replacement` | `get_replacement_record` / `get_replacement_reason` | `None` | Company |
+| `Extension` | Reserved; milestone extensions are not recorded in this version | — | — |
+| `Dispute` | `get_dispute_history` | Disputed milestone | Company or its co-signer |
+| `StatusChange` | `get_status_history` | `None` | Caller; `None` for permissionless calls |
+
+Entries are sorted by ledger. Entries on the same ledger follow the `kind` order above; for example, a replacement comes before the status change it causes. `source_index` is the entry's position in its source, or the `replacement_index` for replacements. Paging follows the other list queries: `page` is 0-indexed, and a `page_size` of 0, a page past the end, or an engagement with no history returns an empty vec.
+
+The dispute, status and split-amendment histories keep their most recent entries only (50, 50 and 20), and replacements requested before replacement records existed have no ledger, so neither appears in the timeline.
+
+---
+
+## Collateral Bonds
+
+### Recruiter bond (#459)
+
+`EngagementConfig::recruiter_bond_amount` escrows a bond from the recruiter at creation. When the engagement reaches `Completed`, `Cancelled` or `Expired`, the bond is settled once. If some milestone had a dispute resolve against its proof and was never confirmed or resolved afterwards, `get_bond_forfeit_bps` of the bond (default 100 %) goes to the company. Otherwise the whole bond returns to the recruiter. Query it with `get_recruiter_bond`.
+
+### Co-recruiter bond (#506)
+
+`EngagementConfig::co_recruiter_bond_amount` escrows a separate bond from the `co_recruiter` at creation. It is ignored when there is no co-recruiter. It uses the same trigger as the recruiter bond, tracked on its own record, and is settled independently. The co-recruiter shares in payouts, so it shares the liability in proportion to its payout share:
+
+```text
+co_forfeit = co_bond × bond_forfeit_bps × (10_000 − recruiter_split_bps) ÷ 10_000²
+```
+
+`recruiter_split_bps` is read at settlement. The rest returns to the co-recruiter, and the recruiter bond's own forfeiture does not change. Query it with `get_co_recruiter_bond(engagement_id)` → `Option<(amount, forfeited)>`.
+
+---
+
+## Pull Payouts (#547)
+
+By default every payout is pushed to the recruiter and co-recruiter inside the confirming transaction. If a recipient cannot receive the token, for example because it has no trustline or its balance is frozen, the whole confirmation reverts and the company cannot confirm.
+
+Setting `EngagementConfig::pull_payouts = true` at creation switches the engagement to a claim model. Every amount that would be transferred to the recruiter side is instead credited to `RecruiterClaimable(recipient, token)`. That covers milestone payouts on every confirmation and dispute path, streamed-payout claims and bond refunds. A confirmation then never fails because of the recipient's account.
+
+| Function | Caller | Description |
+|---|---|---|
+| `claim_payouts(recruiter, token)` → `i128` | Recruiter or co-recruiter (must sign) | Transfer everything credited in `token` across all engagements, and return the amount. Returns `0` without transferring when nothing is owed. Fails with `ContractPaused` while paused. If the account still cannot receive, the claim reverts and the balance stays credited. |
+| `get_claimable_payout(recruiter, token)` → `i128` | Anyone | Amount credited and not yet claimed. |
+| `is_pull_payouts_enabled(engagement_id)` → `bool` | Anyone | Whether the engagement credits instead of pushing. |
+
+Notes:
+
+- Credits are in the engagement's escrow token. The [payout token preference](#which-write-function-do-i-call) (`set_recruiter_payout_token`) is not applied to credited amounts.
+- Fees, arbiter fees and refunds to the company are still transferred immediately.
+- The flag is set once at creation and stored under `DataKey2::PullPayouts(engagement_id)`. It does not change the `Engagement` record.
+
+Events: `("payout_credited", recipient)` with `(engagement_id, token, amount)`; `("payouts_claimed", recruiter)` with `(token, amount)`.
+
+## Recruiter Acceptance (#569)
+
+`create_engagement` normally locks escrow and makes the engagement `Active` straight away, without the recruiter agreeing to the terms. Setting `EngagementConfig::require_recruiter_acceptance = true` creates it in the `Offered` status instead. The escrow (and any bonds) are still locked at creation.
+
+| Function | Caller | Description | Panics |
+|---|---|---|---|
+| `accept_engagement(recruiter, engagement_id)` | Recruiter or their cosigner | `Offered` → `Active`. Placement milestones' no-show clocks start at acceptance. Retention unlock ledgers stay as computed at creation. | `ContractPaused`, `EngagementPaused`, `EngagementNotOffered`, `unauthorized` |
+| `withdraw_offer(company, engagement_id)` | Company or its cosigner | `Offered` → `Cancelled`. Refunds the full escrow (to the pool for pool-funded engagements), returns any bonds, and frees the cap slot. | `ContractPaused`, `EngagementPaused`, `EngagementNotOffered`, `unauthorized` |
+
+While `Offered`:
+
+- No milestone action is accepted: `submit_proof`, confirmations, disputes, `top_up_escrow`, `cancel_engagement` and the rest fail with `engagement is not active`.
+- The engagement counts against the per-company cap (`set_max_active_per_company`) and the recruiter caps (`set_recruiter_active_cap`, `set_max_active_per_recruiter`).
+- Status queries list it under `Offered`, never under `Active` (`get_engagement_ids_by_status`, `get_engagement_count_by_status`, summaries).
+- An offer the recruiter never accepts can be closed by `expire_engagement` once the inactivity timeout passes, with a full refund.
+
+Events: `("engagement_offered", engagement_id)` with `(company, recruiter, total_amount)` after `engagement_created`; `("engagement_accepted", engagement_id)` with `recruiter`; `("offer_withdrawn", engagement_id)` with the refund. Acceptance and withdrawal also emit `status_changed` and are recorded in `get_status_history`.
 
 ---
 
@@ -427,9 +1215,9 @@ rate each other for the same engagement. Use `is_recruiter_rated` /
 `is_company_rated` to hide a rating prompt instead of surfacing the failure.
 
 Ratings are credited to whoever holds the role at completion time. If the
-recruiter role was transferred mid-engagement via `accept_recruiter_transfer`,
-the incoming address receives the rating — matching where the milestone payouts
-went.
+recruiter role was transferred mid-engagement via
+[`accept_recruiter_transfer`](#recruiter-transfer), the incoming address receives
+the rating — matching where the milestone payouts went.
 
 ## Token Allowlist
 
@@ -443,7 +1231,159 @@ The contract supports an optional allowlist to restrict which tokens can be used
 ### Engagement Creation
 When the token allowlist is enabled, `create_engagement` will panic with `TokenNotAllowed` if the `token` passed is not in the allowed tokens list. If the allowlist is disabled, any valid SAC token is accepted.
 
+## Cosigners
+
+A company or recruiter may register a **cosigner** — a secondary address that is
+equally authorized to perform that party's actions (e.g. confirming milestones,
+submitting proof, approving amendments). This lets a primary signer delegate
+operations to a bot, vault, or backup key without sharing the primary key.
+
+Registration is one-way per party and only the primary address may set its own
+cosigner:
+
+- `set_company_cosigner(company, cosigner)` — delegates company-side actions.
+- `set_recruiter_cosigner(recruiter, cosigner)` — delegates recruiter-side actions.
+
+The registered cosigner (or `None` if none was set) can be read back with:
+
+- `get_company_cosigner(company)` → `Option<Address>`
+- `get_recruiter_cosigner(recruiter)` → `Option<Address>`
+
+Once registered, the contract's `is_authorized_company` / `is_authorized_recruiter`
+checks accept **either** the primary signer **or** the cosigner. A cosigned action
+is therefore still a single on-chain call — it just uses the cosigner as the
+authenticated caller instead of the primary.
+
+### Single-signer vs. cosigned flow
+
+```mermaid
+sequenceDiagram
+    participant P as Primary (company/recruiter)
+    participant C as Cosigner
+    participant S as Contract
+
+    Note over P,S: Normal single-signer call
+    P->>S: action (e.g. confirm_milestone)
+    S->>S: require_auth(P) + is_authorized?(caller == P)
+    S-->>P: success
+
+    Note over P,C,S: Cosigned call (after set_*_cosigner)
+    P->>S: set_company_cosigner(P, C)
+    S-->>S: store cosigner = C
+
+    C->>S: action (same function, authenticated as C)
+    S->>S: require_auth(C) + is_authorized?(caller == P OR caller == C)
+    S-->>C: success
+```
+
+In both cases the function signature is identical; only the authenticated caller
+changes. Integrators adding a cosigner do not need new entry points — they simply
+route the existing call through the cosigner's key.
+
 ## Public Function Reference
+
+### Which write function do I call?
+
+Use this to find the state-changing call for a task. It is the write-side
+counterpart of [Which query do I call?](#which-query-do-i-call). The caller
+column names the address that must sign. Wherever a company or recruiter
+signs, that party's registered cosigner may sign instead (see
+[Cosigners](#cosigners)). Engagement, dispute and payout calls fail with
+`ContractPaused` while the contract is paused. Most admin configuration
+setters, the cosigner setters and the payout-token setters still work while
+paused. Engagement-scoped calls also fail with `EngagementPaused` while that
+engagement is quarantined.
+
+#### Company
+
+| I want to… | Call |
+|---|---|
+| Open an engagement and fund escrow | `create_engagement` |
+| Withdraw an offer the recruiter has not accepted | `withdraw_offer` |
+| Open an engagement with arbiters drawn from the admin pool | `create_engagement_random_panel` |
+| Register an arbiter panel to share across several engagements | `create_engagement_bundle` |
+| Add funds to an engagement's escrow | `top_up_escrow` |
+| Pre-fund a pooled balance, or withdraw from it | `deposit_company_balance` / `withdraw_company_balance` |
+| Accept a milestone's proof and pay the recruiter | `confirm_milestone` |
+| Accept several milestones in one transaction | `batch_confirm_milestones` |
+| Dispute a milestone's proof | `raise_dispute` |
+| Ask the recruiter for a replacement candidate | `request_replacement` |
+| Approve a recruiter's proposed handover to a new address | `accept_recruiter_transfer` |
+| Hand the company role on an engagement to another address | `transfer_company` |
+| Rate the recruiter on a completed engagement | `rate_recruiter` |
+| Redeem accrued fee rebates | `redeem_company_rebate` |
+| Let a second key act for the company | `set_company_cosigner` |
+
+#### Recruiter
+
+| I want to… | Call |
+|---|---|
+| Accept an engagement offered to me | `accept_engagement` |
+| Submit proof that a milestone is done | `submit_proof` |
+| Withdraw payouts credited by `pull_payouts` engagements | `claim_payouts` |
+| Submit several evidence items as one proof | `submit_proof_root` (Merkle root) |
+| Withdraw the vested part of a streamed milestone payout | `claim_streamed_payout` |
+| Get paid in a different token | `set_recruiter_payout_token` / `clear_recruiter_payout_token` |
+| Hand the engagement to another recruiter address | `propose_recruiter_transfer` (then the company calls `accept_recruiter_transfer`) |
+| Let a second key act for the recruiter | `set_recruiter_cosigner` |
+
+#### Company or recruiter
+
+| I want to… | Call |
+|---|---|
+| Cancel the engagement and refund unreleased escrow | `cancel_engagement` (both must sign) |
+| Change the co-recruiter fee split | `propose_split_amendment`, then the other party calls `accept_split_amendment` or `reject_split_amendment` |
+| Change this engagement's dispute window | `propose_dispute_window_override`, then the other party calls `accept_dispute_window_override` or `reject_dispute_window_override` |
+| Force-confirm a milestone the company ignored past the confirm window | `force_confirm_milestone` |
+
+#### Arbiters
+
+| I want to… | Call | Caller |
+|---|---|---|
+| Vote on a disputed milestone | `cast_arbiter_vote` | Arbiter |
+| Vote a percentage split (when split voting is enabled) | `cast_arbiter_split_vote` | Arbiter |
+| Let another address vote for my slot | `set_arbiter_vote_delegate` | Arbiter |
+| Step aside from one dispute | `recuse_arbiter` | Arbiter |
+| Hand my seat to a successor | `nominate_arbiter_successor`, then the successor calls `claim_arbiter` | Arbiter, then nominee |
+| Decide an escalated dispute | `super_arbiter_resolve` | Super-arbiter |
+
+#### Anyone (permissionless)
+
+These calls take no signer. They only succeed once their on-chain condition
+holds, so a keeper or either party can run them.
+
+| I want to… | Call |
+|---|---|
+| Move a retention milestone from `Locked` to `Pending` after its unlock ledger | `unlock_milestone` |
+| Recuse arbiters who missed the vote deadline, and settle the dispute on the votes cast | `enforce_vote_deadline` |
+| Send a stalled dispute to the super-arbiter | `escalate_dispute` |
+| Settle an escalated dispute the super-arbiter did not decide in time | `resolve_escalation_timeout` |
+| Forfeit a placement milestone the recruiter never proved in time | `trigger_no_show` |
+| Close an inactive engagement and refund the company | `expire_engagement` |
+| Apply a time-locked contract upgrade | `execute_upgrade` |
+
+#### Admin
+
+| I want to… | Call |
+|---|---|
+| Initialise the contract | `init` |
+| Hand over the admin role | `nominate_admin`, then the nominee calls `claim_admin` |
+| Halt, or resume, every state-changing call | `pause` / `unpause` |
+| Freeze, or unfreeze, a single engagement | `pause_engagement` / `unpause_engagement` |
+| Set up the emergency M-of-N pause | `set_emergency_signers`, `set_emergency_vote_window`; signers then vote with `cast_emergency_pause_vote` |
+| Require a second signer on sensitive setters | `set_config_cosigner`, `set_sensitive_functions`; the cosigner approves each change with `accept_config_change` |
+| Set platform fees | `set_platform_fee`, `set_fee_tiers`, `remove_fee_tier`, `waive_platform_fee`, `set_fee_rebate_bps`, `set_token_platform_fee`, `set_company_platform_fee` / `remove_company_platform_fee` |
+| Split fees across several treasuries | `set_fee_treasuries` / `clear_fee_treasuries` |
+| Manage referrals | `add_referrer`, `remove_referrer`, `set_referral_discount_bps` |
+| Control which tokens and amounts are accepted | `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`, `set_min_amount`, `set_token_min_amount`, `remove_token_min_amount` |
+| Tune timing windows | `set_confirm_window`, `set_dispute_window`, `set_proof_cooldown`, `set_cooldown_rating_discount`, `set_no_show_deadline_ledgers`, `set_amendment_ttl`, `set_super_arbiter_deadline`, `set_arbiter_vote_deadline` |
+| Tune limits | `set_max_active_per_company`, `set_max_replacements` |
+| Configure arbitration | `set_super_arbiter`, `set_arbiter_fee`, `set_split_voting_enabled`, `add_arbiter_pool_member`, `remove_arbiter_pool_member`, `set_bond_forfeit_bps` |
+| Grow or shrink one engagement's arbiter panel | `admin_add_arbiter` / `admin_remove_arbiter` |
+| Configure payout-token swaps | `set_swap_adapter` / `clear_swap_adapter` |
+| Mark a recruiter as verified | `set_recruiter_verified` |
+| Upgrade the contract | `set_upgrade_lock_duration`, `propose_upgrade`, then anyone calls `execute_upgrade` |
+| Label the deployed version | `set_version` |
 
 ### Admin & Configuration
 
@@ -452,8 +1392,18 @@ Functions that manage contract-wide settings, admin succession, and operational 
 | Function | Caller | Purpose | Panics |
 |---|---|---|---|
 | `set_platform_fee(admin, bps, treasury)` | Admin | Set platform fee in basis points (max 500 = 5%) and recipient treasury. | `ContractPaused`, `NoAdmin`, `unauthorized`, `FeeTooHigh` |
-| `get_platform_fee()` → `(u32, Address)` | Anyone | Return current `(bps, treasury)`; defaults to `(0, admin)`. | — |
-| `set_version(admin, version)` | Admin | Set contract version string (max 32 chars). | `NoAdmin`, `unauthorized`, `VersionTooLong` |
+| `get_platform_fee()` → `(u32, Address)` | Anyone | Return current **base** `(bps, treasury)`; defaults to `(0, admin)`. Does not resolve fee tiers. | — |
+| `set_fee_tiers(admin, tiers)` | Admin | Replace the fee-tier list (max 10, strictly ascending `threshold`, each `bps` ≤ base platform fee). Empty vec clears tiers. | `ContractPaused`, `NoAdmin`, `unauthorized`, `too many fee tiers`, `tier bps exceeds base platform fee`, `tier threshold must be positive`, `tiers must be sorted by ascending threshold` |
+| `waive_platform_fee(admin, engagement_id)` | Admin | Permanently zero the platform fee for future payouts on one engagement. Overrides base fee, tiers and referral discount. Not blocked by pause. See [Fee waiver](#fee-waiver). | `NoAdmin`, `unauthorized`, `engagement not found` |
+| `is_fee_waived(engagement_id)` → `bool` | Anyone | Return `true` if the engagement's platform fee is waived. Unknown IDs return `false`. | — |
+| `get_fee_tiers()` → `Vec<FeeTier>` | Anyone | Return configured tiers; empty vec means flat base fee. | — |
+| `set_company_platform_fee(admin, company, bps)` | Admin | Override the base fee rate for one company (max 500). See [Per-company fee override](#per-company-fee-override-539). | `ContractPaused`, `NoAdmin`, `unauthorized`, `FeeTooHigh` |
+| `remove_company_platform_fee(admin, company)` | Admin | Remove a company's override. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_company_platform_fee(company)` → `Option<u32>` | Anyone | Return a company's override, if any. | — |
+| `set_fee_treasuries(admin, treasuries)` | Admin | Split fees across weighted treasuries. See [Multiple treasuries](#multiple-treasuries-540). | `ContractPaused`, `NoAdmin`, `unauthorized`, `EmptyTreasuryList`, `TooManyTreasuries`, `InvalidTreasuryWeight`, `DuplicateTreasury`, `TreasuryWeightsMustSumTo10000` |
+| `clear_fee_treasuries(admin)` | Admin | Go back to the single `PlatformFee.treasury`. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `get_fee_treasuries()` → `Vec<(Address, u32)>` | Anyone | Return the weighted treasuries; empty when unset. | — |
+| `set_version(admin, version)` | Admin | Set a version label (max 32 chars); does not check upgrade or storage compatibility. | `NoAdmin`, `unauthorized`, `VersionTooLong` |
 | `set_min_amount(admin, amount)` | Admin | Set minimum engagement amount in raw token units. | `NoAdmin`, `unauthorized` |
 | `pause(admin)` | Admin | Pause all state-changing operations. | `NoAdmin`, `unauthorized` |
 | `unpause(admin)` | Admin | Resume state-changing operations. | `NoAdmin`, `unauthorized` |
@@ -469,8 +1419,83 @@ Functions that manage contract-wide settings, admin succession, and operational 
 
 Additional admin functions (documented elsewhere): `init`, `renounce_admin`, `set_ledgers_per_day`, `set_max_retention_days`, `set_max_milestones`, `set_inactivity_timeout_ledgers`, `set_storage_ttl_extend_to`, `set_confirm_window`, `set_dispute_window`, `set_max_proof_hash_length`, `set_arbiter_fee`, `set_amendment_ttl`, `set_upgrade_lock_duration`, `propose_upgrade`, `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`.
 
+### Versioning & Backwards Compatibility
+
+`set_version` stores a version string for identification; it is only a label. It
+does not validate the WASM, check compatibility, or migrate contract state. An
+`execute_upgrade` replaces the contract code but does not automatically transform
+existing stored records. New WASM must continue to read records written by prior
+versions, including `Engagement` and `Milestone` values. Treat changes to their
+stored representation or field types as potentially incompatible, and provide
+and verify an explicit migration before deploying such a change. Deployment and
+upgrade procedures will be documented in `DEPLOYMENT.md` when that guide exists.
+
 ### Engagement Lifecycle
-`create_engagement`, `unlock_milestone`, `notify_milestone_due_soon`, `submit_proof`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`
+`create_engagement`, `accept_engagement`, `withdraw_offer`, `unlock_milestone`, `notify_milestone_due_soon`, `submit_proof`, `submit_proof_root`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`, `propose_recruiter_transfer`, `accept_recruiter_transfer`, `claim_payouts`
+
+### Multi-Item Proof (Merkle Root)
+
+`submit_proof` records one proof hash per milestone. When a milestone is backed
+by several documents, the recruiter can instead call
+`submit_proof_root(recruiter, engagement_id, milestone_index, merkle_root)` with
+the root of a Merkle tree built off-chain over those documents (issue #486).
+
+- **Tree format.** Each leaf is the 32-byte `sha256` of one evidence item. Each
+  parent is `sha256(min(a, b) || max(a, b))`: the two children are sorted
+  before hashing, so a proof is just the list of sibling hashes, with no
+  left/right flags. A one-item set has the leaf itself as its root.
+- **Same lifecycle.** `submit_proof_root` goes through the same checks,
+  resubmission cooldown and `Pending → ProofSubmitted` transition as
+  `submit_proof`. The milestone's `proof_hash` becomes `"merkle:"` followed by
+  the root in hex, so confirmation, disputes and replacements work unchanged.
+- **Verification.** `verify_proof_inclusion(engagement_id, milestone_index, leaf, proof)`
+  is permissionless and read-only. It returns `true` only if `leaf` plus the
+  sibling path `proof` (at most 32 hashes) recomputes the milestone's committed
+  root. `get_proof_merkle_root` returns that root.
+- **Replacement.** A root stops counting as soon as the milestone's proof
+  changes. That happens on a plain `submit_proof` resubmission, a rejected
+  dispute or a replacement request. After that, both queries return
+  `None` / `false`.
+
+### Recruiter Transfer
+
+The recruiter role on an engagement can be handed to a new address through a
+two-step **propose → accept** flow, so the outgoing recruiter cannot unilaterally
+redirect future payouts and the company must consent to the replacement.
+
+1. **Propose** — the current recruiter (or the recruiter's registered cosigner)
+   calls `propose_recruiter_transfer(recruiter, engagement_id, new_recruiter)`.
+   This records `new_recruiter` as a *pending* transfer but leaves
+   `engagement.recruiter` unchanged: until the proposal is accepted, all payouts
+   and ratings still follow the original recruiter.
+2. **Accept** — the engagement's company (or the company's registered cosigner)
+   calls `accept_recruiter_transfer(company, engagement_id)`. Only then does the
+   pending address become the engagement's recruiter.
+
+Both steps require the engagement to be `Active` or `ReplacementRequested`, and
+both respect the contract-wide pause and the per-engagement quarantine guards
+(see [Per-Engagement Pause](#per-engagement-pause-quarantine)).
+
+On acceptance the contract changes the engagement as follows:
+
+- Sets `engagement.recruiter` to the proposed address, so all future milestone
+  payouts and completion-time [feedback ratings](#feedback-ratings) are credited
+  to the new recruiter.
+- Updates `engagement.last_activity_ledger` to the current ledger sequence.
+- Removes the pending `ProposedRecruiterTransfer(engagement_id)` record.
+- Emits `("recruiter_transferred", engagement_id)` with
+  `(old_recruiter, new_recruiter)`.
+
+Because the proposal is stored per engagement, only one transfer can be pending
+at a time; a later `propose_recruiter_transfer` call overwrites the pending
+address before it is accepted (no proposal event is emitted until acceptance).
+See the [role-transfer error entries](#role-transfer--cosigner) for the failure
+modes.
+
+| Function | Caller | Purpose | Panics |
+|---|---|---|---|
+| `propose_recruiter_transfer(recruiter, engagement_id, new_recruiter)` | Current recruiter (or recruiter co-signer) | Record `new_recruiter` as the pending recruiter for the engagement. Does not change payouts until accepted. | `ContractPaused`, `EngagementPaused`, `unauthorized`, `engagement is not active` |
+| `accept_recruiter_transfer(company, engagement_id)` | Company (or company co-signer) | Promote the pending recruiter to `engagement.recruiter` and emit `recruiter_transferred`. | `ContractPaused`, `EngagementPaused`, `unauthorized`, `engagement is not active`, `no pending recruiter transfer` |
 
 ### Per-Engagement Pause (Quarantine)
 
@@ -499,6 +1524,52 @@ The two pause mechanisms are orthogonal and both must pass for a call to
 proceed: an engagement can be quarantined while the contract runs normally, and
 calling `unpause` on the contract does **not** lift a per-engagement quarantine.
 
+#### Interaction with the global pause
+
+The two mechanisms are tracked in **separate storage flags** and enforced by two
+independent guards — `assert_not_paused` for the contract-wide pause and
+`assert_engagement_not_paused` for the quarantine (see `lib.rs`). A
+state-changing call must clear **both** guards to proceed; they are an **AND**,
+not an OR.
+
+Because they are independent, neither pause clears the other:
+
+- `unpause(admin)` — the contract-wide resume **does not** lift a per-engagement
+  quarantine. An engagement quarantined before the contract was paused stays
+  quarantined after the contract is resumed; its lifecycle calls keep failing
+  with `EngagementPaused` until `unpause_engagement` is called for that ID.
+- `unpause_engagement(admin, engagement_id)` — lifting a single engagement's
+  quarantine **does not** resume a globally paused contract. While the whole
+  contract is paused, that engagement's calls still fail with `ContractPaused`
+  regardless of its own quarantine state.
+
+The combined effect for any given engagement:
+
+| Global pause | Engagement quarantine | State-changing call |
+|---|---|---|
+| off | off | proceeds |
+| off | on  | rejected — `EngagementPaused` |
+| on  | off | rejected — `ContractPaused` |
+| on  | on  | rejected — `ContractPaused` (global guard checked first) |
+
+**Example.** An admin quarantines `ENG-42` with `pause_engagement` while the
+contract is running, then later pauses the whole contract with `pause` for
+maintenance:
+
+1. `pause_engagement(admin, "ENG-42")` → `is_engagement_paused("ENG-42")` is
+   `true`, while `is_paused()` is still `false`.
+2. `pause(admin)` → `is_paused()` becomes `true`; `ENG-42` remains quarantined.
+3. A lifecycle call on `ENG-42` now fails with `ContractPaused` (the global guard
+   is checked before the engagement guard).
+4. `unpause(admin)` → `is_paused()` is `false` again, **but** `ENG-42` is still
+   quarantined, so its calls still fail with `EngagementPaused`.
+5. `unpause_engagement(admin, "ENG-42")` → quarantine lifted; lifecycle calls on
+   `ENG-42` proceed normally.
+
+To check ahead of a write, query both `is_paused()` and
+`is_engagement_paused(engagement_id)` — a call is only accepted when **both**
+return `false`.
+
 ### Milestone Due-Soon Notifications
 
 Soroban contracts cannot schedule their own work, so the due-soon signal follows
@@ -522,8 +1593,42 @@ The call deliberately does **not** touch `last_activity_ledger`: a notification
 is not engagement activity, and bumping it would let a keeper postpone
 `expire_engagement` indefinitely.
 
+### Engagement Tags
+
+Engagements can be labelled with free-form string tags so off-chain tooling can
+group and filter them (e.g. by client, role, or campaign). Tags are managed by
+the engagement's **company** (or its registered co-signer) and are only ever read
+by the tag-based queries — they do not affect escrow, payments, or lifecycle.
+
+**Limits** (enforced when the engagement is created via `config.tags`):
+
+- **Max tags per engagement: 10** — creating with more panics `TooManyTags`.
+- **Max tag length: 32 characters** — a longer tag panics `TagTooLong`; a
+  zero-length tag panics `TagEmpty`.
+- Tags are de-duplicated at creation, so a repeated tag lists the engagement once
+  in its index.
+
+These bounds exist so storage stays predictable regardless of caller input. The
+cap is checked at creation time; `add_engagement_tag` appends to a tag's
+engagement index without re-checking the per-engagement cap.
+
+| Function | Caller | Purpose | Panics |
+|---|---|---|---|
+| `add_engagement_tag(company, engagement_id, tag)` | Company (or co-signer) | Add `engagement_id` to a tag's index. Duplicate tags are silently ignored. | `unauthorized`, `engagement not found` |
+| `remove_engagement_tag(company, engagement_id, tag)` | Company (or co-signer) | Remove `engagement_id` from a tag's index. No-op if the tag was not present. | `unauthorized`, `engagement not found` |
+| `get_engagements_by_tag(tag, page, page_size)` → `Vec<String>` | Anyone | Paginated engagement IDs tagged with `tag`. Out-of-range pages return an empty vec. | — |
+| `get_engagement_tag_count(tag)` → `u32` | Anyone | Total number of engagements tagged with `tag`. Returns `0` for a tag no engagement has. | — |
+
+`get_engagement_tag_count` is the companion to `get_engagements_by_tag` for
+sizing pagination: pass the same `tag` to both to know how many pages to fetch.
+
 ### Amendments
 `propose_amendment`, `accept_amendment`, `reject_amendment`, `withdraw_amendment_proposal`
+
+### Cosigners
+`set_company_cosigner`, `get_company_cosigner`, `set_recruiter_cosigner`, `get_recruiter_cosigner`
+
+See [Cosigners](#cosigners) for the full authorization-delegation flow.
 
 ### Arbiter Succession
 `nominate_arbiter_successor`, `claim_arbiter`
@@ -574,6 +1679,120 @@ claim_arbiter()
 
 Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
+#### Admin Panel Resize (#507)
+
+Succession swaps one slot for another. To change the panel's size instead, the admin calls:
+
+| Function | Purpose |
+|---|---|
+| `admin_add_arbiter(admin, engagement_id, new_arbiter, new_quorum)` | Append a slot. Quorum is unchanged unless `new_quorum` is `Some`. On a weighted panel the new slot has weight 1. |
+| `admin_remove_arbiter(admin, engagement_id, arbiter, new_quorum)` | Remove a slot and its weight. Panics `QuorumUnreachable` if the current quorum would exceed the remaining panel, unless `new_quorum` supplies a reachable one. Also clears the removed arbiter's vote delegate and any succession nomination it made. |
+
+Whenever `new_quorum` is given, it must be between 1 and the new panel's total weight (`invalid quorum`). Both calls panic `PanelChangeDuringDispute` while any milestone is `Disputed`, and reject terminal engagements. Like other admin panel repairs, they still work on a quarantined engagement. Other panics: `DuplicateArbiter`, `CompanyArbiterCollision` and `RecruiterArbiterCollision` on add; `ArbiterNotFound` and `at least one arbiter required` on remove. They emit `arbiter_added` or `arbiter_removed` with `(arbiter, quorum)`.
+
+#### Arbiter Vote Deadline (#560)
+
+A dispute can stall when an arbiter never votes. With a vote deadline
+configured, anyone can recuse the arbiters who have not voted once the
+deadline passes, and the dispute is settled on the votes that were cast.
+
+| Function | Access | Purpose |
+|---|---|---|
+| `set_arbiter_vote_deadline(admin, ledgers)` | Admin | Set the vote deadline in ledgers, measured from when the dispute was raised. `0` (the default) disables it. Emits `arbiter_vote_deadline_set`. |
+| `get_arbiter_vote_deadline()` → `u32` | Public | Return the vote deadline in ledgers (`0` = disabled). |
+| `enforce_vote_deadline(engagement_id, milestone_index)` | Permissionless | Recuse every panel arbiter who has not voted, then settle the dispute on the recomputed quorum or leave it ready to escalate. |
+
+**What enforcement does.** Once the current ledger is past
+`dispute_raised_ledger + deadline`:
+
+1. Every panel arbiter who has not voted, and has not already recused, is
+   added to the dispute's recusal list. This is the same list that
+   `recuse_arbiter` writes, so they can no longer vote (binary or split).
+2. Each of them gets `ArbiterStats::missed_vote_deadlines` incremented. The
+   random-pool selection weight counts a missed deadline as a second unanswered
+   assignment, so `completion = 100 * votes_cast / (disputes_assigned + missed_vote_deadlines)`.
+3. The quorum is recomputed over the weight still on the dispute:
+   `effective_quorum = ceil(quorum * active_weight / total_weight)`, at least 1.
+4. Every arbiter still on the dispute has voted, so the dispute settles
+   right away if anyone voted:
+   - binary votes approve when `approve_weight >= effective_quorum`, and
+     otherwise reject, because `reject_weight > active_weight - effective_quorum`
+     then holds;
+   - split votes settle at the weighted median, as `cast_arbiter_split_vote` would.
+
+   No arbiter fee is paid on a payout settled this way, because no single vote
+   decided it.
+5. If nobody voted, the dispute stays `Disputed` and every arbiter is recused.
+   `escalate_dispute` can then be called right away, without waiting for the
+   dispute window to elapse.
+
+For example, with a 3-arbiter panel and quorum 2, if only one arbiter votes
+before the deadline, the other two are recused, the effective quorum becomes
+`ceil(2 * 1 / 3) = 1`, and the single vote decides the dispute.
+
+Recusals are per dispute. They are cleared when the dispute resolves and when
+a new dispute is raised on the milestone.
+
+| Panic | When |
+|---|---|
+| `VoteDeadlineDisabled` | The vote deadline is `0`. |
+| `engagement is not active` / `milestone is not in disputed status` | There is no live dispute to enforce. |
+| `no dispute in progress` | No dispute raise ledger is recorded for the milestone. |
+| `VoteDeadlineNotReached` | The current ledger is not yet past `dispute_raised_ledger + deadline`. |
+| `NoPendingVoters` | Every panel arbiter has already voted or recused. |
+
+#### Dispute Escalation to Super Arbiter
+
+If a dispute's arbiter votes remain split — neither the approval quorum nor the
+rejection threshold reached — past the dispute window, it can be escalated to a
+single configured Super Arbiter for a tie-breaking resolution.
+
+| Function | Access | Purpose |
+|---|---|---|
+| `set_super_arbiter(admin, super_arbiter)` | Admin | Configure (or replace) the Super Arbiter address used to resolve escalated disputes. |
+| `get_super_arbiter()` → `Option<Address>` | Public | Return the currently configured Super Arbiter, or `None` if none has been set. |
+| `is_dispute_escalated(engagement_id, milestone_index)` → `bool` | Public | Return whether the dispute on that milestone is currently escalated. |
+| `escalate_dispute(engagement_id, milestone_index)` | Permissionless | Escalate an eligible, still-hung dispute to the configured Super Arbiter. |
+| `super_arbiter_resolve(super_arbiter, engagement_id, milestone_index, approve)` | Super Arbiter | Directly approve or reject an escalated dispute, bypassing the normal M-of-N vote. |
+
+**Escalation eligibility.** A dispute becomes eligible for `escalate_dispute`
+only when **all** of the following hold:
+
+1. The contract and the engagement are not paused.
+2. The engagement is `Active`.
+3. The milestone is `Disputed`.
+4. The dispute window has elapsed (measured from when `raise_dispute` was called),
+   or `enforce_vote_deadline` has run on the dispute (see [Arbiter Vote Deadline](#arbiter-vote-deadline-560)).
+5. Neither approval nor rejection has reached its quorum (the vote is still hung).
+6. A Super Arbiter has been configured.
+
+**Anyone can call `escalate_dispute` once those conditions are satisfied.** No
+client, freelancer, arbiter, or admin authorization is required — escalation
+follows the same permissionless-keeper pattern as `unlock_milestone`.
+
+**Normal arbiter voting vs. Super Arbiter resolution.** The Super Arbiter
+resolves an escalated dispute directly, without the M-of-N threshold that normal
+arbiter voting requires:
+
+| | Normal arbiter voting | Super Arbiter resolution |
+|---|---|---|
+| Trigger | `cast_arbiter_vote` | `super_arbiter_resolve` |
+| Decision makers | Multiple arbiters | Configured Super Arbiter |
+| Threshold | M-of-N quorum | No vote threshold |
+| Authorization | Individual arbiter | Configured Super Arbiter |
+| Approval | Quorum resolves dispute | Direct approval resolves dispute |
+| Rejection | Quorum rejection returns dispute to `Pending` | Direct rejection returns dispute to `Pending` |
+| Arbiter fee | Deciding arbiter | Super Arbiter |
+
+**Timeout.** If the Super Arbiter does not call `super_arbiter_resolve` within
+the configured response window (default `super_arbiter_response_window`, ~3
+days) after escalation, the permissionless `resolve_escalation_timeout` may be
+invoked to auto-resolve the escalated dispute in the recruiter's favor — no
+arbiter fee is deducted since the Super Arbiter did not act. The admin can tune
+the window via `set_super_arbiter_deadline(admin, ledgers)` and read it with
+`get_super_arbiter_deadline()`; `get_super_arbiter_resolutions()` reports the
+total number of disputes concluded through the escalation path.
+
 ### Early Exit
 
 The early-exit protocol allows a **recruiter** to request a graceful exit from an engagement before all milestones are completed. It is a three-step flow involving both the recruiter and the company.
@@ -622,7 +1841,46 @@ On rejection, the engagement returns to `Active` and the recruiter must continue
 
 ### Read-Only Queries
 
+- **`get_config_snapshot()`**: Fetches all active contract configuration tunables and parameters in a single read-only call, eliminating the need for indexers to make multiple round-trips.
+
+
 All read-only functions are permissionless and require no authentication.
+
+#### Which query do I call?
+
+A quick lookup for common frontend needs. See the subsections below for full
+argument and return-type details.
+
+| Frontend need | Function |
+|---|---|
+| Show a company their active engagements | `get_engagements_by_company` + `get_company_active_count` |
+| Show all engagements (admin / explorer view) | `get_engagement_ids_by_status` + `get_engagement_count` |
+| List engagements that opted into public listing (job board / explorer) | `get_public_engagement_ids` |
+| Show one engagement's full detail | `get_engagement` / `get_engagement_summary` |
+| Show an engagement's milestone list + status | `get_all_milestone_statuses` |
+| Show a single milestone's detail | `get_milestone` |
+| Check if a milestone is unlockable now | `is_milestone_unlockable` |
+| Show how long until a milestone unlocks | `ledgers_until_unlock` / `get_estimated_unlock_seconds` |
+| Warn a user a milestone is due soon | `is_milestone_due_soon` |
+| Show how much has been released / remains in escrow | `get_total_released` / `get_escrow_balance` |
+| Check if an engagement is finished | `get_is_engagement_complete` |
+| Show milestone unlock progress for a bar | `get_unlock_progress` |
+| Show a recruiter's / company's star rating | `get_recruiter_rating` / `get_company_rating` |
+| Check whether I already rated someone | `is_recruiter_rated` / `is_company_rated` |
+| Show pending milestone amendment / its TTL | `get_pending_amendment` / `get_amendment_ttl` |
+| Show amendment history for a milestone | `get_amendment_log` |
+| Show arbiter vote tally on a dispute | `get_arbiter_votes` |
+| Show why a milestone is in dispute | `get_dispute_reason` |
+| Check that one evidence item is in a milestone's committed proof set | `verify_proof_inclusion` / `get_proof_merkle_root` |
+| Show replacement history / reason | `get_replacement_count` / `get_replacement_reason` / `get_replacement_record` |
+| Show everything that happened on an engagement, in order | `get_engagement_timeline` |
+| Show past disputes / status transitions | `get_dispute_history` / `get_status_history` |
+| Show a recruiter's / co-recruiter's bond | `get_recruiter_bond` / `get_co_recruiter_bond` |
+| Fetch the contract PDF / metadata hash | `get_contract_pdf_hash` / `get_metadata_hash` |
+| Is the contract (or one engagement) paused? | `is_paused` / `is_engagement_paused` |
+| Load current config in one call (indexers) | `get_config_snapshot` |
+| Fetch a single config value | `get_version`, `get_min_amount`, `get_platform_fee`, `get_allowed_tokens`, … |
+| Show open dispute count on an engagement | `get_active_dispute_count` |
 
 #### Engagement Queries
 
@@ -637,6 +1895,21 @@ All read-only functions are permissionless and require no authentication.
 | `get_contract_pdf_hash` | `engagement_id: String` | `Option<String>` |
 | `get_total_released` | `engagement_id: String` | `i128` |
 | `get_escrow_balance` | `engagement_id: String` | `i128` |
+| `batch_get_engagement_summary` | `engagement_ids: Vec<String>` | `Vec<EngagementSummary>` |
+
+`batch_get_engagement_summary(engagement_ids: Vec<String>) -> Vec<EngagementSummary>`
+returns the same [`EngagementSummary`](#engagementsummary) shape as
+`get_engagement_summary`, but for many engagements in one call — letting a
+dashboard render a list view without one round-trip per row.
+
+- **Max batch size**: 20 IDs per call; passing more than 20 panics with
+  `"too many IDs"`.
+- **Unknown IDs**: silently skipped rather than causing a panic — the
+  returned vector may be shorter than `engagement_ids` when some entries
+  don't exist. Unlike `get_engagement_summary`, which panics with
+  `EngagementNotFound` for a single missing ID, the batch variant never
+  panics on missing entries; check the length (or missing `id` values) of
+  the result if you need to detect which IDs were skipped.
 
 #### Milestone Queries
 
@@ -662,6 +1935,9 @@ All read-only functions are permissionless and require no authentication.
 | `get_company_active_count` | `company: Address` | `u32` |
 | `get_engagement_ids_by_status` | `status: EngagementStatus`, `page: u32`, `page_size: u32` | `Vec<String>` |
 | `get_engagement_count_by_status` | `status: EngagementStatus` | `u32` |
+| `get_engagements_by_amount_range` | `min_amount: i128`, `max_amount: i128`, `page: u32`, `page_size: u32` | `Vec<String>` |
+| `get_engagement_count_by_amount` | `min_amount: i128`, `max_amount: i128` | `u32` |
+| `get_public_engagement_ids` | `page: u32`, `page_size: u32` | `Vec<String>` |
 
 `get_engagement_ids_by_status` paginates the **filtered** result, so page 0 always
 holds the first `page_size` matches regardless of how many non-matching
@@ -671,6 +1947,71 @@ per-company / per-recruiter queries when the party is already known. Its backing
 index is populated at `create_engagement`, so engagements created before this
 function was deployed are not enumerated (their records stay readable via
 `get_engagement`).
+
+`page` is 0-indexed and `status` accepts any
+[`EngagementStatus`](#engagementstatus) variant, so
+`get_engagement_ids_by_status(EngagementStatus::Active, 0, 50)` returns the
+first 50 IDs currently in `Active` status. A `page_size` of `0` returns an
+empty vec rather than erroring or falling back to a default size; an unset
+caller-side page size therefore silently yields nothing. Requesting a page
+past the last match also returns an empty vec, so iterate until a page comes
+back empty instead of precomputing a page count
+(`get_engagement_count_by_status` can size one, but its count shifts as
+engagements change status between calls). Results reflect each engagement's
+status at call time, and index entries whose engagement record has expired
+from storage are skipped rather than returned stale.
+
+`get_engagements_by_amount_range` works the same way, filtering on each
+engagement's `total_amount` instead of its status. The range
+`[min_amount, max_amount]` is inclusive on both ends, so
+`get_engagements_by_amount_range(1_000, 1_000, 0, 50)` returns engagements of
+exactly `1_000`. Pagination follows the rules above: `page` is 0-indexed over
+the **filtered** matches, a `page_size` of `0` returns an empty vec, and a page
+past the last match comes back empty. `get_engagement_count_by_amount` returns
+the total number of matches for the same range and can size a pagination loop.
+Both functions scan the full engagement index, share its coverage caveat for
+engagements created before the index existed, and skip expired records. Both
+panic with `"InvalidAmountRange"` when `min_amount > max_amount`; the paginated
+query checks `page_size == 0` first, so a zero page size returns an empty vec
+even for an inverted range.
+
+##### Engagement visibility
+
+Every engagement has an `is_public` flag. It is copied from
+`EngagementConfig::is_public` in `create_engagement` and defaults to `false` in
+the usual config. Only `get_public_engagement_ids` reads it, and that function
+returns the IDs of engagements created with `is_public: true`.
+
+```rust
+let mut config = default_config();
+config.is_public = true;               // opt in at creation
+client.create_engagement(/* ..., */ &config);
+
+let page0 = client.get_public_engagement_ids(&0, &50); // first 50 public IDs
+```
+
+- **It is a listing flag, not access control.** A private engagement is only
+  left out of this one enumeration. Soroban ledger state is public, so a
+  private engagement stays fully readable by anyone who knows its ID
+  (`get_engagement`, `get_engagement_summary`, …). It also still appears in
+  `get_engagement_ids_by_status`, `get_engagements_by_amount_range`,
+  `get_engagements_by_company` and `get_engagements_by_recruiter`, and in
+  every event it emits. Never use `is_public: false` to hide sensitive data.
+- **It is fixed at creation.** No function flips `is_public` later, and it is
+  not an amendable field. To change visibility you need a new engagement.
+- **It is independent of status.** Completed, cancelled and expired public
+  engagements are still listed. Filter on status client-side if you only want
+  open roles.
+- **Pagination** works like `get_engagement_ids_by_status`. `page` is
+  0-indexed over the **public** matches only, `page_size == 0` returns an empty
+  vec, and a page past the last match comes back empty, so iterate until you
+  get an empty page. No count function exists for public engagements.
+- **Cost and coverage** are also the same as `get_engagement_ids_by_status`.
+  The function walks `DataKey::AllEngagements` in creation order and loads
+  each record until it has filled the requested page. Late pages therefore
+  cost more, and a sparse public set means scanning many private records.
+  Engagements missing from that index, and index entries whose record has
+  expired, are skipped.
 
 #### Amendment Queries
 
@@ -700,6 +2041,7 @@ means "no ratings yet", not "rated zero".
 |---|---|---|
 | `get_replacement_reason` | `engagement_id: String`, `replacement_index: u32` | `Option<String>` |
 | `get_replacement_count` | `engagement_id: String` | `u32` |
+| `get_replacement_record` | `engagement_id: String`, `replacement_index: u32` | `Option<ReplacementRecord>` |
 
 #### Contract Config Getters
 
@@ -708,6 +2050,7 @@ means "no ratings yet", not "rated zero".
 | `get_version` | — | `String` |
 | `get_min_amount` | — | `i128` |
 | `get_platform_fee` | — | `(u32, Address)` |
+| `get_fee_tiers` | — | `Vec<FeeTier>` |
 | `get_ledgers_per_day` | — | `u32` |
 | `get_max_retention_days` | — | `u32` |
 | `get_max_milestones` | — | `u32` |
@@ -740,6 +2083,22 @@ admin transaction to land between two reads and yield a torn view.
 | `is_engagement_paused` | `engagement_id: String` | `bool` |
 | `get_admin` | — | `Address` |
 | `get_pending_admin` | — | `Option<Address>` |
+| `get_contract_health` | — | `ContractHealth` |
+
+`get_contract_health()` bundles the most commonly polled diagnostic fields
+into a single read-only call, so an off-chain keeper or status page doesn't
+need four separate round-trips:
+
+| Field | Type | Description |
+|---|---|---|
+| `paused` | `bool` | Whether the global pause switch is engaged. `false` if never set. |
+| `admin` | `Address` | The current contract admin. |
+| `version` | `String` | Contract version string set via `set_version`; falls back to the default version string if never set. |
+| `total_engagement_count` | `u64` | Total number of engagements ever created — monotonic, so cancelled/completed engagements stay counted and the value never decreases. |
+
+Each call also emits a `contract_health_snapshot` event carrying the same
+`ContractHealth` value, so keepers polling this view show up on-chain rather
+than only in RPC access logs.
 
 ### Milestone Confirmation Functions
 
@@ -867,6 +2226,7 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | Event | Topics | Payload | Trigger |
 |---|---|---|---|
 | `platform_fee_set` | — | `(bps, treasury)` | `set_platform_fee` |
+| `fee_tiers_set` | — | `tiers.len()` | `set_fee_tiers` |
 | `version_set` | — | `version` | `set_version` |
 | `min_amount_set` | — | `amount` | `set_min_amount` |
 | `paused` | — | `admin` | `pause` |
@@ -886,12 +2246,15 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `upgrade_lock_duration_set` | — | `ledgers` | `set_upgrade_lock_duration` |
 | `max_proof_hash_length_set` | — | `len` | `set_max_proof_hash_length` |
 | `arbiter_fee_set` | — | `bps` | `set_arbiter_fee` |
+| `arbiter_vote_deadline_set` | — | `ledgers` | `set_arbiter_vote_deadline` |
 | `due_soon_window_set` | — | `ledgers` | `set_due_soon_window` |
 | `engagement_paused` | `engagement_id` | `admin` | `pause_engagement` |
 | `engagement_unpaused` | `engagement_id` | `admin` | `unpause_engagement` |
 | `token_allowlisted` | — | `token` | `add_allowed_token` |
 | `token_removed` | — | `token` | `remove_allowed_token` |
 | `allowlist_enabled_set` | — | `enabled` | `set_token_allowlist_enabled` |
+| `super_arbiter_set` | — | `super_arbiter` | `set_super_arbiter` |
+| `super_arbiter_deadline_set` | — | `ledgers` | `set_super_arbiter_deadline` |
 
 ### Upgrade
 
@@ -905,6 +2268,11 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | Event | Topics | Payload | Trigger |
 |---|---|---|---|
 | `engagement_created` | `engagement_id` | `engagement_id` | `create_engagement` |
+| `engagement_offered` | `engagement_id` | `(company, recruiter, total_amount)` | `create_engagement` with `require_recruiter_acceptance` |
+| `engagement_accepted` | `engagement_id` | `recruiter` | `accept_engagement` |
+| `offer_withdrawn` | `engagement_id` | `refund` | `withdraw_offer` |
+| `payout_credited` | `recipient` | `(engagement_id, token, amount)` | Any payout on a `pull_payouts` engagement |
+| `payouts_claimed` | `recruiter` | `(token, amount)` | `claim_payouts` |
 | `engagement_cancelled` | `engagement_id` | `refund` | `cancel_engagement` (company + recruiter) |
 | `engagement_expired` | `engagement_id` | `refund` | `expire_engagement` (permissionless keeper) |
 | `engagement_completed` | `engagement_id` | `(engagement_id, released_amount, ledger)` | Final milestone confirmed |
@@ -919,12 +2287,13 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 |---|---|---|---|
 | `milestone_unlocked` | `engagement_id` | `(milestone_index, valid_after_ledger, unlocked_at_ledger)` | `unlock_milestone` |
 | `milestone_due_soon` | `engagement_id` | `(milestone_index, valid_after_ledger, ledgers_remaining, window)` | `notify_milestone_due_soon` (permissionless keeper) |
-| `proof_submitted` | `engagement_id` | `milestone_index` | `submit_proof` (first submission) |
-| `proof_resubmitted` | `engagement_id` | `(milestone_index, old_hash, proof_hash)` | `submit_proof` (resubmission) |
+| `proof_submitted` | `engagement_id` | `milestone_index` | `submit_proof` / `submit_proof_root` (first submission) |
+| `proof_resubmitted` | `engagement_id` | `(milestone_index, old_hash, proof_hash)` | `submit_proof` / `submit_proof_root` (resubmission) |
+| `proof_root_submitted` | `engagement_id` | `(milestone_index, merkle_root)` | `submit_proof_root` (after `proof_submitted` / `proof_resubmitted`) |
 | `milestone_confirmed` | `engagement_id` | `(milestone_index, payment)` | `confirm_milestone` / `batch_confirm_milestones` |
 | `milestone_force_confirmed` | `engagement_id` | `(milestone_index, payment)` | `force_confirm_milestone` (permissionless after window) |
 | `milestone_status_changed` | `engagement_id` | `(milestone_index, old_status, new_status)` | Any milestone status transition |
-| `platform_fee_collected` | `engagement_id` | `(milestone_index, fee_amount, treasury)` | Milestone confirmation when fee > 0 |
+| `platform_fee_collected` | `engagement_id` | `(milestone_index, fee_amount, treasury)` | Milestone confirmation when fee > 0. With [multiple treasuries](#multiple-treasuries-540), one event per treasury with that treasury's share as the amount |
 
 ### Dispute
 
@@ -933,6 +2302,50 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `dispute_raised` | `engagement_id` | `(milestone_index, reason)` | `raise_dispute` |
 | `arbiter_voted` | `engagement_id` | `(milestone_index, approve)` | `cast_arbiter_vote` |
 | `dispute_resolved` | `engagement_id` | `(milestone_index, approved)` | Quorum reached in `cast_arbiter_vote` |
+| `arbiter_vote_deadline_missed` | `engagement_id` | `(milestone_index, arbiter)` | `enforce_vote_deadline`, once per recused arbiter |
+| `vote_deadline_enforced` | `engagement_id` | `(milestone_index, recused_count, effective_quorum)` | `enforce_vote_deadline`, before any resolution events |
+| `dispute_escalated` | `engagement_id` | `(milestone_index, super_arbiter)` | `escalate_dispute` |
+| `dispute_escalation_resolved` | `engagement_id` | `(milestone_index, super_arbiter, approved)` | `super_arbiter_resolve` |
+| `super_arbiter_timeout_resolved` | `engagement_id` | `milestone_index` | `resolve_escalation_timeout` (auto-favor recruiter) |
+
+#### Dispute-to-Super-Arbiter Escalation Path
+
+Disputes normally resolve through M-of-N arbiter voting. If no quorum is reached
+before the dispute window elapses, the dispute can be escalated to a configured
+super arbiter for a tie-breaking resolution (issue #246):
+
+```
+   Company            Arbiter(s)           HireSettle           Super-Arbiter
+      │                    │                    │                     │
+      │ raise_dispute(engagement_id, milestone_index, reason)         │
+      │────────────────────────────────────────▶│                     │
+      │                    │                    │                     │
+      │                    │                    │ milestone: ProofSubmitted ▶ Disputed
+      │                    │                    │                     │
+      │                    │ cast_arbiter_vote(approve = true/false)  │
+      │                    │───────────────────▶│                     │
+      │                    │                    │                     │
+      │                    │                    │ tallies M-of-N votes│
+      │                    │                    │                     │
+      │                    │                    │ approve_votes >= quorum ▶ Confirmed (payment released)
+      │                    │                    │ reject_votes > N - quorum ▶ Pending (proof cleared)
+      │                    │                    │                     │
+      │                    │ no quorum reached  │                     │
+      │                    │ dispute window elapses                   │
+      │                    │                    │                     │
+      │ escalate_dispute(engagement_id, milestone_index) [any keeper] │
+      │────────────────────────────────────────▶│                     │
+      │                    │                    │                     │
+      │                    │                    │  dispute_escalated  │
+      │                    │                    │────────────────────▶│
+      │                    │                    │                     │
+      │                    │                    │ super_arbiter_resolve(engagement_id, milestone_index, approve)
+      │                    │                    │◀────────────────────│
+      │                    │                    │                     │
+      │                    │                    │ approve  ▶ Resolved (payment released)
+      │                    │                    │ reject   ▶ Pending (proof cleared)
+      │                    │                    │                     │
+```
 
 ### Amendment
 
@@ -1001,6 +2414,8 @@ cd contracts/hiresettle && cargo test
 
 Tests cover creation, proof submission, confirmation, disputes, arbiter voting, replacement flow, early exit, amendments, batch confirmations, auto-confirm, expiry, admin configuration, and edge cases for all validation rules.
 
+See [TESTING.md](TESTING.md) for how `test.rs` is organised, its shared helpers, and how to run a single test or a group of tests (`cargo test <name> -- --exact`).
+
 ---
 
 ## Usage Example
@@ -1055,12 +2470,109 @@ stellar contract invoke \
 
 ---
 
+## Numeric Precision
+
+All money math in the contract uses integers. There are no floats and no fixed-point library. Knowing the three unit systems below and the one rounding rule tells you, to the unit, what every party is paid.
+
+### Units
+
+| Quantity | Type | Unit | Range / cap |
+|---|---|---|---|
+| Token amounts (`total_amount`, `released_amount`, fees, payouts, bonds, min amounts) | `i128` | Raw base units of the engagement's token | `total_amount > 0` and `>=` the effective min amount |
+| `Milestone.payment_percent` | `u32` | Whole percent, divisor `100` | All milestones must sum to exactly `100` |
+| Split-vote `split_percent` / settled split | `u32` | Whole percent, divisor `100` | `0..=100` |
+| Platform fee `PlatformFee.bps` | `u32` | Basis points, divisor `10_000` | `<= 500` (5%) — `FeeTooHigh` |
+| Fee tier `FeeTier.bps` | `u32` | Basis points | `<=` current base platform fee |
+| Referral discount | `u32` | Basis points, subtracted from the fee rate | `<= 500` |
+| Arbiter fee | `u32` | Basis points | `<= 200` (2%) — `ArbiterFeeTooHigh` |
+| Fee rebate (`set_fee_rebate_bps`) | `u32` | Basis points of each collected platform fee | `<= 500` — `FeeTooHigh` |
+| `recruiter_split_bps` | `u32` | Basis points kept by the primary recruiter | `<= 10_000` — `InvalidSplitBps` |
+| Bond forfeit (`set_bond_forfeit_bps`) | `u32` | Basis points | `<= 10_000` — `InvalidBondForfeitBps` |
+
+A milestone percentage and a basis-point rate are **different scales**. `payment_percent: 30` means 30%, and `platform_fee_bps: 30` means 0.30%. Milestone percentages are whole numbers, so a 33.33% milestone can't be expressed. Use something like `33 / 33 / 34`.
+
+### Token decimals
+
+The contract never calls a token's `decimals()`. `1_000_000_000` means 100 USDC for a 7-decimal Stellar asset and 0.000000001 of an 18-decimal token. Every percentage and bps result is the same *fraction* on any token, but absolute thresholds are not: `set_min_amount` and fee-tier `threshold`s are compared against raw units. Prefer per-token minimums (`set_token_min_amount`). Only allowlist tokens of comparable precision if you rely on tiers. All examples in this README use 7-decimal USDC, where `1 USDC = 10_000_000` units. (Tests: `test_engagement_payout_math_is_decimal_agnostic_for_18_decimal_token`, `test_min_amount_is_raw_units_not_scaled_per_token_decimals`.)
+
+### Order of operations
+
+For a single milestone payout:
+
+```text
+gross        = total_amount × payment_percent ÷ 100            (minus any replacement_paid_out)
+platform_fee = gross × effective_platform_bps ÷ 10_000
+after_fee    = gross − platform_fee
+arbiter_fee  = after_fee × arbiter_fee_bps ÷ 10_000             (approved disputes only)
+net          = after_fee − arbiter_fee
+primary      = net × recruiter_split_bps ÷ 10_000               (only when a co-recruiter is set)
+co_recruiter = net − primary
+```
+
+The platform fee is then split further: `credit = (platform_fee − rebate_offset) × fee_rebate_bps ÷ 10_000` goes to the company's rebate balance and the rest goes to the treasury. For a split-vote dispute, `gross` is first scaled by `settled_percent ÷ 100` and the unreleased part is withheld for the company. For a streamed payout, `net` vests as `net × min(elapsed, duration) ÷ duration`.
+
+The arbiter fee is taken from the amount **after** the platform fee, not from `gross`, so the two rates compound rather than add: 250 bps + 200 bps removes 4.45%, not 4.50%.
+
+### Rounding rule
+
+Every `÷` above is Rust integer division on non-negative `i128`, which **rounds down**. Wherever the contract computes a remainder by subtraction (`gross − fee`, `net − primary`, `fee − credit`), the party on the subtracted side receives the rounding dust. So:
+
+| Division | Rounded down | Receives the dust |
+|---|---|---|
+| Platform / arbiter fee | Treasury / arbiter | Recruiter(s) |
+| Co-recruiter split | Primary recruiter | Co-recruiter |
+| Fee rebate credit | Company rebate | Treasury |
+| Streamed vesting | Early claims | Final claim (`vested == total` exactly once `elapsed >= duration`) |
+| Milestone share `total × pct ÷ 100` | Every milestone | **Nobody** — see below |
+
+Worked example: 1,000 USDC engagement (`10_000_000_000` units), 30% milestone, 250 bps fee, 60/40 co-recruiter split:
+
+```text
+gross        = 10_000_000_000 × 30 ÷ 100      = 3_000_000_000
+platform_fee = 3_000_000_000 × 250 ÷ 10_000   =    75_000_000   → treasury
+net          = 3_000_000_000 − 75_000_000     = 2_925_000_000
+primary      = 2_925_000_000 × 6_000 ÷ 10_000 = 1_755_000_000   → recruiter
+co_recruiter = 2_925_000_000 − 1_755_000_000  = 1_170_000_000   → co-recruiter
+```
+
+Rounding examples:
+
+- **A fee rounds to zero on tiny payouts.** A fee is only charged once `gross × bps >= 10_000`. At 250 bps a gross share of `399` units gives `399 × 250 ÷ 10_000 = 9` (not 9.975), and anything under `40` units pays no fee and emits no `platform_fee_collected` event.
+- **The split remainder goes to the co-recruiter.** With a net of `1_001` and `recruiter_split_bps = 3_333`, the primary gets `333` and the co-recruiter gets `668`. (Test: `test_co_recruiter_split_with_odd_percentage_remainder`.)
+
+### Milestone-share dust stays in escrow
+
+Each milestone's share is rounded down on its own. The shares therefore add up to exactly `total_amount` only when `total_amount × payment_percent` is divisible by 100 for every milestone. For example, `total_amount = 1_000_000_007` with a `30 / 40 / 30` schedule pays `300_000_002 + 400_000_002 + 300_000_002 = 1_000_000_006`, which leaves **1 unit** behind. `released_amount` never reaches `total_amount`, so `get_escrow_balance` reports `1` after the engagement is `Completed`. No function refunds or sweeps it: `cancel_engagement` requires an `Active` or `ReplacementRequested` engagement, and `expire_engagement` refuses a `Completed` one. The loss is at most `milestone_count − 1` units (well under one cent for 7-decimal tokens), but it is real.
+
+**To avoid it, make `total_amount` a multiple of 100.** Every whole-percent share is then exact.
+
+### Which fee reductions apply on each payout path
+
+Every payout path resolves the effective platform-fee rate through the same helper, so the fee waiver, company override, per-token override, fee tiers (or snapshot) and referral discount apply identically everywhere. Every path also collects the fee the same way, so the fee rebate and multi-treasury routing apply everywhere. Only the arbiter fee differs:
+
+| Payout path | Platform fee (all reductions) | Arbiter fee |
+|---|---|---|
+| `confirm_milestone` | ✓ | — |
+| `batch_confirm_milestones` | ✓ | — |
+| `force_confirm_milestone` | ✓ | — |
+| `cast_arbiter_vote` (approve) / `cast_arbiter_split_vote` | ✓ | ✓ |
+| `super_arbiter_resolve` (approve) | ✓ | ✓ |
+| `resolve_escalation_timeout` | ✓ | — |
+
+Before #539, `batch_confirm_milestones` and `force_confirm_milestone` skipped the referral discount, and `batch_confirm_milestones` paid the treasury directly without the fee rebate.
+
+### Overflow
+
+Every intermediate product is at most `total_amount × 10_000`, so any `total_amount` below about `1.7 × 10³⁴` units is safe in `i128`. The contract uses plain operators, not `checked_*`. The workspace release profile sets `overflow-checks = true`, so an overflow aborts the transaction and never wraps silently. Counters and ledger arithmetic use `saturating_*` where they could overflow (`page × page_size`, TTL expiry ledgers).
+
+---
+
 ## Security Considerations
 
 - **Authorization**: Every state-changing function calls `require_auth()`. Recruiters cannot confirm their own milestones. Companies cannot cast arbiter votes.
 - **No party/arbiter address overlap**: `create_engagement` rejects `company == recruiter`, `company` appearing in the arbiter set, or `recruiter` appearing in the arbiter set. Without this check a company could name itself (or a colluding address) as arbiter and vote on its own disputes, or name itself as recruiter to self-confirm milestones.
 - **Multi-arbiter quorum**: Disputes require M-of-N arbiter votes to resolve. A single arbiter cannot unilaterally release or withhold payment — both approval and rejection require a configurable quorum. Duplicate votes from the same arbiter are rejected on-chain.
-- **Token amounts are raw integer units, not decimal-aware**: The token allowlist accepts any allowlisted SAC, not just USDC. `total_amount`, `MinEngagementAmount`, and all milestone payout math (`amount * payment_percent / 100`) operate on raw integer units of whichever token is used — the contract never reads a token's `decimals()`. Percentage splits are exact regardless of precision, but a single admin-wide minimum amount (`set_min_amount`) will represent a different real-world value across tokens of different precision (e.g. 7-decimal vs. 18-decimal tokens). Integrators are responsible for only allowlisting tokens of comparable precision, or adjusting the minimum accordingly, when using a token other than the reference 7-decimal USDC used throughout this README's examples.
+- **Token amounts are raw integer units, not decimal-aware**: The token allowlist accepts any allowlisted SAC, not just USDC. `total_amount`, `MinEngagementAmount`, and all milestone payout math (`amount * payment_percent / 100`) operate on raw integer units of whichever token is used — the contract never reads a token's `decimals()`. Percentage splits are exact regardless of precision, but a single admin-wide minimum amount (`set_min_amount`) will represent a different real-world value across tokens of different precision (e.g. 7-decimal vs. 18-decimal tokens). Integrators are responsible for only allowlisting tokens of comparable precision, or adjusting the minimum accordingly, when using a token other than the reference 7-decimal USDC used throughout this README's examples. See [Numeric Precision](#numeric-precision).
 - **Arbiter fee cap**: The arbiter fee is capped at 200 bps (2%) to prevent excessive deduction from recruiter payouts on dispute approval.
 - **Retention double-check**: `confirm_milestone()` re-verifies `valid_after_ledger` even if `unlock_milestone()` was called, preventing a company from confirming a retention milestone before the window truly ends.
 - **Replacement fee fairness**: The Placement tranche paid to the recruiter is non-refundable. Only unreleased amounts are frozen. This is explicit in the contract and documented clearly so both parties understand the terms at engagement creation.
@@ -1076,11 +2588,238 @@ stellar contract invoke \
 - [x] Replacement clause with clock reset (`request_replacement`: company-only, requires confirmed Placement; resets the Placement milestone, restarts retention clocks, panics on bad preconditions, and emits the `replacement_requested` event)
 - [x] Dispute resolution via arbiter
 - [x] Flexible milestone structure (2-milestone 50/50, 3-milestone, custom)
-- [x] 11 unit tests
+- [x] Unit tests — 282 `#[test]` functions (see `cargo test` output for current count)
 - [ ] Multi-candidate engagements (multiple positions, one company-recruiter pair)
 - [ ] Partial payout on replacement (configurable replacement fee)
 - [x] Contract upgrade mechanism
 - [ ] Mainnet deployment
+
+---
+
+---
+
+## Errors
+
+The contract uses panic messages (strings) to signal errors instead of a formal error enum. This reference table documents the most frequently encountered error messages, their triggering conditions, and which function(s) raise them. Off-chain integrators can match on these message strings to classify and handle errors appropriately.
+
+### Contract Lifecycle Errors
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `ContractPaused` | Any state-changing function | The admin has called `pause()` and not yet called `unpause()`. Check `is_paused()` before retrying. |
+| `EngagementPaused` | Any engagement-scoped state-changing function | The admin has quarantined this specific engagement via `pause_engagement()`. Check `is_engagement_paused(engagement_id)` before retrying. |
+| `NoAdmin` | Any admin-gated function | The admin has called `renounce_admin()`, permanently disabling all admin operations. This is irreversible. |
+| `unauthorized` | Any function with role-based authorization | Caller does not match the required role (e.g. called `confirm_milestone` as recruiter instead of company) or is not a registered co-signer. Check authorization helpers: `is_authorized_company()`, `is_authorized_recruiter()`, `get_admin()`. |
+
+### Engagement Creation & Management
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `AlreadyInitialized` | `init` (repeated call) | The contract has already been initialized. `init` is idempotent by re-write but not by guard. |
+| `InvalidEngagementId` | `create_engagement` | `engagement_id` is empty, exceeds 64 characters, or contains non-alphanumeric + hyphen characters. |
+| `JobTitleEmpty` | `create_engagement` | `job_title` is empty. Provide a non-empty short job title (max 64 chars). |
+| `JobTitleTooLong` | `create_engagement` | `job_title` exceeds 64 characters. Truncate and retry. |
+| `ZeroMilestones` | `create_engagement` | Engagement created with an empty milestone list. At least one milestone is required. |
+| `TooManyMilestones` | `create_engagement` | Milestone count exceeds the admin-configured max (default 10). Check `get_max_milestones()` and request higher limit from admin or split into multiple engagements. |
+| `MilestoneNameEmpty: index {i}` | `create_engagement` | Milestone `i` has an empty `name` field. All milestones must have a non-empty name. |
+| `MilestoneNameTooLong: index {i}` | `create_engagement` | Milestone `i`'s `name` exceeds 64 characters. Truncate milestone names and retry. |
+| `DuplicateMilestoneName: {name}` | `create_engagement` | Two or more milestones share the same `name`. Each milestone must have a unique name. |
+| `TooManyTags` | `create_engagement` or `get_engagements_by_multiple_tags` | More than 10 tags provided. Reduce tag count to ≤ 10. |
+| `TagEmpty: index {i}` | `create_engagement` | Tag `i` in `config.tags` is an empty string. All tags must be non-empty. |
+| `TagTooLong: index {i}` | `create_engagement` | Tag `i` exceeds 32 characters. Shorten all tags to ≤ 32 chars. |
+| `amount must be greater than zero` | `create_engagement` | `total_amount ≤ 0`. The escrow fee must be a positive amount. |
+| `AmountBelowMinimum` | `create_engagement` | `total_amount` is below the admin-configured minimum (default 100,000 stroops). Check `get_effective_min_amount(token)` for the resolved minimum and retry with higher amount. |
+| `CompanyRecruiterCollision` | `create_engagement` | `company == recruiter`. The company and recruiter must be different addresses. |
+| `CompanyArbiterCollision` | `create_engagement` | `company` appears in the arbiter list. The company cannot be an arbiter on its own engagements (conflict of interest). |
+| `RecruiterArbiterCollision` | `create_engagement` | `recruiter` appears in the arbiter list. The recruiter cannot be an arbiter on its own engagements (conflict of interest). |
+| `at least one arbiter required` | `create_engagement` | The arbiter list is empty. Provide at least one arbiter address. |
+| `invalid quorum` | `create_engagement` | `quorum` is 0, greater than the number of arbiters, or otherwise invalid. Set `quorum` to 1 ≤ quorum ≤ arbiters.len(). |
+| `TokenNotAllowed` | `create_engagement` | The token allowlist is enabled and `token` is not in it. Check `get_allowed_tokens()` or request the admin to allowlist your token with `add_allowed_token()`. |
+| `CompanyBlacklisted` | `create_engagement` | The `company` address is on the admin's blacklist (issue #358). Contact the admin to be removed. |
+| `RecruiterBlacklisted` | `create_engagement` | The `recruiter` address is on the admin's blacklist (issue #359). Contact the admin to be removed. |
+| `engagement already exists` | `create_engagement` | An engagement with this `engagement_id` has already been created. Use a unique engagement ID. |
+| `milestone percentages must sum to 100` | `create_engagement` | The `payment_percent` fields across all milestones do not sum to exactly 100. Adjust percentages so they total 100. |
+| `CompanyActiveLimitReached` | `create_engagement` | The company has reached the admin-configured limit of simultaneously active engagements (default 50). Cancel or complete an existing engagement before creating a new one. Check `get_company_active_count()` and `get_max_active_per_company()`. |
+| `engagement not found` | Any query or state-changing function | The engagement ID does not exist. Check the ID spelling and ensure `create_engagement` has been successfully called. |
+| `RetentionDaysZero` | `create_engagement` | A retention milestone has `days = 0` in the `retention_days` vector. Retention windows must be positive. Set all retention days ≥ 1. |
+| `RetentionDaysTooLarge` | `create_engagement` | A retention milestone exceeds the admin-configured max (default 365 days). Either request a higher limit from the admin or split multi-year retentions into shorter windows. |
+| `InvalidMetadataHash` | `create_engagement` | `config.metadata_hash` is an empty string. Omit the field entirely or provide a real IPFS CID. |
+| `InvalidContractPdfHash` | `create_engagement` | `config.contract_pdf_hash` is an empty string. Omit the field entirely or provide a real attestation hash. |
+| `InvalidSplitBps` | `create_engagement` | `config.recruiter_split_bps > 10_000`. The split percentage must be ≤ 100% (≤ 10,000 basis points). |
+
+### Milestone Operations
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `engagement is not active` | Various | The engagement status is not `Active` (e.g. it is `Completed`, `Cancelled`, or `ReplacementRequested` when only `Active` is valid). Check engagement status and only perform this operation on active engagements. |
+| `invalid milestone index` | Any function taking `milestone_index` | The index is out of bounds for the engagement's milestone list. Ensure `milestone_index < milestone_count`. |
+| `milestone is not locked` | `unlock_milestone` | The target milestone's status is not `Locked`. Call `is_milestone_unlockable()` first to check preconditions. |
+| `only retention milestones can be unlocked this way` | `unlock_milestone` | A `Placement` milestone (which starts `Pending`) cannot be unlocked. Only `Retention` milestones have a `Locked` state. |
+| `retention window has not elapsed yet` | `unlock_milestone` or `confirm_milestone` | `current_ledger < valid_after_ledger`. Wait additional ledgers for the retention period to elapse before retrying. Call `ledgers_until_unlock()` to check how many ledgers remain. |
+| `InvalidProofHash` | `submit_proof` or `add_milestone_attachment` | The proof hash is empty. Provide a non-empty IPFS CID or proof URI. |
+| `ProofHashTooLong` | `submit_proof` or `add_milestone_attachment` | The proof hash exceeds the admin-configured max length (default 200 chars). Provide a shorter proof identifier or request the admin to increase the limit with `set_max_proof_hash_length()`. |
+| `milestone is not pending` | `submit_proof` | The milestone status is not `Pending` (e.g. already `ProofSubmitted` or further along). Reset the milestone or check the status before resubmitting. |
+| `ResubmitTooSoon` | `submit_proof` | A proof was previously submitted on this milestone and rejected. The admin-configured proof cooldown (default ~4 hours) has not elapsed. Wait before resubmitting. |
+| `DuplicateProofHash` | `submit_proof` | The same proof hash is already used by another milestone in this engagement. Use a unique proof hash per milestone or per resubmission. |
+| `milestone proof not yet submitted` | `confirm_milestone` or similar | The milestone status is not `ProofSubmitted`. The recruiter must call `submit_proof()` first. |
+| `PreviousMilestoneNotComplete` | `confirm_milestone`, `batch_confirm_milestones`, or `execute_scheduled_auto_confirm` | An earlier milestone (lower index) has not yet been confirmed or resolved (issue #67: sequential confirmation rule). Complete earlier milestones first. |
+| `only retention milestones can be due soon` | `notify_milestone_due_soon` | Attempted to check due-soon status on a `Placement` milestone. Only `Retention` milestones have time-gate-based due-soon windows. |
+| `milestone is already unlockable` | `notify_milestone_due_soon` | The deadline has already passed; the milestone can be unlocked immediately. Call `unlock_milestone()` instead. |
+| `DueSoonWindowNotReached` | `notify_milestone_due_soon` | The milestone is still further out than the due-soon window. Wait for it to approach its deadline. |
+| `DueSoonAlreadyNotified` | `notify_milestone_due_soon` | The due-soon notification has already been emitted for this deadline. Check `is_milestone_due_soon_notified()` before retrying. |
+| `milestone is not in disputed status` | `cast_arbiter_vote` or similar | The milestone is not in `Disputed` status (e.g. `ProofSubmitted` or already resolved). The company must raise a dispute first via `raise_dispute()`. |
+| `can only dispute a submitted proof` | `raise_dispute` | The milestone status is not `ProofSubmitted`. The recruiter must submit proof before the company can dispute it. |
+| `DisputeWindowClosed` | `raise_dispute` | The dispute window has elapsed since the proof was submitted. Disputes must be raised within the admin-configured window (default ~3 days). Check `get_dispute_window()` for the current limit. |
+
+### Dispute Resolution
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `duplicate vote` | `cast_arbiter_vote` | This arbiter has already voted on this dispute. Each arbiter may vote once per dispute. |
+| `DisputeWindowNotElapsed` | `escalate_dispute` | The dispute window has not yet elapsed since the dispute was raised, and `enforce_vote_deadline` has not run on it. Wait for the window to pass before escalating to the super arbiter. |
+| `ArbiterRecused` | `cast_arbiter_vote` or `cast_arbiter_split_vote` | The arbiter recused from this dispute, or was recused by `enforce_vote_deadline`. |
+| `VoteDeadlineDisabled` | `enforce_vote_deadline` | The admin has not set a vote deadline (`set_arbiter_vote_deadline`). |
+| `VoteDeadlineNotReached` | `enforce_vote_deadline` | The vote deadline has not passed since the dispute was raised. Check `get_arbiter_vote_deadline()`. |
+| `NoPendingVoters` | `enforce_vote_deadline` | Every panel arbiter has already voted or recused, so there is no one to recuse. |
+| `dispute already resolvable without escalation` | `escalate_dispute` | The dispute has already reached quorum (or rejection threshold) and can be resolved via normal arbiter voting. Escalation is only for tied disputes past the window. |
+| `no super arbiter configured` | `escalate_dispute` or `super_arbiter_resolve` | The admin has not set a super arbiter via `set_super_arbiter()`. Either the admin must configure one, or the dispute must be resolved through normal arbiter voting. |
+| `no dispute in progress` | `escalate_dispute` | Attempted to escalate a dispute that was not found in the vote tally. The dispute may have already resolved. |
+| `dispute has not been escalated` | `super_arbiter_resolve` or `resolve_escalation_timeout` | Attempted a super-arbiter resolution on a dispute that is not escalated. Call `escalate_dispute()` first. |
+| `SuperArbiterResponseWindowNotElapsed` | `resolve_escalation_timeout` | The super arbiter still has time to respond. Wait for the admin-configured response deadline to elapse before auto-resolving in the recruiter's favor. Check `get_super_arbiter_deadline()`. |
+| `ReasonTooLong` | `raise_dispute` | The dispute reason string exceeds 128 bytes. Provide a shorter reason. |
+
+### Amendments
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `payment percent must be 0-100` | `propose_amendment` | The new payment percent is outside 0–100 inclusive. |
+| `no pending amendment proposal` | `accept_amendment`, `reject_amendment`, or `get_pending_amendment` | No amendment proposal exists for this milestone. Either the proposal expired, was withdrawn, or was never proposed. |
+| `proposer cannot accept their own proposal` | `accept_amendment` | The acceptor is the same as the original proposer. The counterparty must accept or reject. |
+| `amendment_expired` | `accept_amendment` | The proposal's TTL has elapsed (current ledger > `expires_at_ledger`). The proposal is cleared. |
+| `proposer cannot reject their own proposal` | `reject_amendment` | The rejector is the same as the original proposer. The counterparty must accept or reject. |
+| `unauthorized` | `withdraw_amendment_proposal` | Caller is not the original proposer. Only the proposer may withdraw their own proposal. |
+
+### Milestone Extensions
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `only retention milestones can be extended` | `propose_milestone_extension` | Attempted to extend a `Placement` milestone. Only `Retention` milestones have extendable deadlines. |
+| `milestone is not locked` | `propose_milestone_extension` or `accept_milestone_extension` | The milestone has progressed beyond `Locked` (e.g. to `Pending` or `ProofSubmitted`). Only locked milestones with pending deadlines can be extended. |
+| `additional ledgers must be greater than zero` | `propose_milestone_extension` | The extension request is for 0 ledgers. Provide a positive number of ledgers to extend. |
+| `MilestoneExtensionLimitReached` | `propose_milestone_extension` | This milestone has already been granted the admin-configured maximum number of extensions (default 3). No further extensions are allowed. |
+| `no pending milestone extension proposal` | `accept_milestone_extension` or `reject_milestone_extension` | No extension proposal exists for this milestone. |
+| `milestone_extension_expired` | `accept_milestone_extension` | The extension proposal's TTL has elapsed. The proposal is cleared and an event is emitted. |
+
+### Replacement
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `placement not yet confirmed — use cancel_engagement instead` | `request_replacement` | The placement milestone has not been confirmed yet. Early-stage cancellations use `cancel_engagement()` instead. |
+| `ReplacementLimitReached` | `request_replacement` | The company has already requested the admin-configured maximum number of replacements (default 3). No further replacements are allowed. |
+| `replacement reason too long` | `request_replacement` | The reason string exceeds 128 bytes. Provide a shorter reason. |
+
+### Early Exit
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `no exit request pending` | `accept_early_exit` or `reject_early_exit` | The engagement status is not `ExitRequested`. The recruiter must call `request_early_exit()` first. |
+| `engagement is in a terminal state` | `nominate_arbiter_successor` or `claim_arbiter` | The engagement is `Completed`, `Cancelled`, or `Expired`. Arbiter succession has no purpose on terminal engagements. |
+
+### Expiry & Cancellation
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `Cannot expire completed engagement` | `expire_engagement` | The engagement is already `Completed` and cannot expire. Expiry only applies to non-terminal states. |
+| `Inactivity timeout not reached` | `expire_engagement` | The inactivity threshold has not been met yet. Wait for `get_inactivity_timeout_ledgers()` ledgers since `last_activity_ledger` before expiring. |
+| `engagement is in a terminal state` | `expire_engagement` | The engagement is already `Cancelled` or `Expired`, so its escrow was already refunded. Checked after the timeout. |
+| `EngagementNotOffered` | `accept_engagement` or `withdraw_offer` | The engagement is not in `Offered` status: it was created without `require_recruiter_acceptance`, or the offer was already accepted, withdrawn or expired. |
+
+### Configuration & Arbiter
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `FeeTooHigh` | `set_platform_fee`, `set_token_platform_fee` or `set_company_platform_fee` | Platform fee `bps > 500` (5%). The fee is capped at 5% for safety. |
+| `EmptyTreasuryList` | `set_fee_treasuries` | The list is empty. Use `clear_fee_treasuries` to go back to the single treasury. |
+| `TooManyTreasuries` | `set_fee_treasuries` | More than 10 treasuries. |
+| `InvalidTreasuryWeight` | `set_fee_treasuries` | A treasury has weight `0`. |
+| `DuplicateTreasury` | `set_fee_treasuries` | The same address appears more than once. |
+| `TreasuryWeightsMustSumTo10000` | `set_fee_treasuries` | The weights do not add up to exactly 10 000 bps. |
+| `discount too high` | `set_referral_discount_bps` | Referral discount `bps > 500`. The discount cannot exceed the maximum platform fee. |
+| `too many fee tiers` | `set_fee_tiers` | More than 10 fee tiers provided. Limit to ≤ 10 tiers. |
+| `tier bps exceeds base platform fee` | `set_fee_tiers` | A tier's `bps` is higher than the current base platform fee. Tiers must be discounts (lower bps), not surcharges. |
+| `tier threshold must be positive` | `set_fee_tiers` | A tier's `threshold ≤ 0`. All tier thresholds must be positive integers. |
+| `tiers must be sorted by ascending threshold` | `set_fee_tiers` | Fee tiers are not in strictly ascending `threshold` order. Sort tiers before retrying. |
+| `VersionTooLong` | `set_version` | Version string exceeds 32 characters. Provide a shorter version identifier (e.g. "0.2.0"). |
+| `InvalidDueSoonWindow` | `set_due_soon_window` | Due-soon window is 0 ledgers. The window must be ≥ 1 ledger. |
+| `InvalidLedgersPerDay` | `set_ledgers_per_day` | Value is outside the range 1–25,920 ledgers. Pick a value in that range. |
+| `InvalidMaxActivePerCompany` | `set_max_active_per_company` | Count is 0. At least 1 active engagement per company must be allowed. |
+| `ArbiterFeeTooHigh` | `set_arbiter_fee` | Arbiter fee `bps > 200` (2%). The fee is capped at 2% for fairness. |
+| `InvalidMaxProofHashLength` | `set_max_proof_hash_length` | Length is outside 1–500 characters. |
+| `InvalidSuperArbiterResponseWindow` | `set_super_arbiter_deadline` | Response window is 0 ledgers. Must be ≥ 1. |
+| `InvalidMinAmount` | `set_token_min_amount` | Minimum amount ≤ 0. Must be positive. |
+| `ArbiterNotFound` | `admin_replace_arbiter` | The old arbiter is not in the engagement's arbiter list. |
+| `CompanyArbiterCollision` | `admin_replace_arbiter` | The new arbiter is the engagement's company (conflict of interest). |
+| `RecruiterArbiterCollision` | `admin_replace_arbiter` | The new arbiter is the engagement's recruiter (conflict of interest). |
+| `DuplicateArbiter` | `admin_replace_arbiter` | The new arbiter is already in the arbiter list. |
+
+### Role Transfer & Cosigner
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `no pending recruiter transfer` | `accept_recruiter_transfer` | No recruiter transfer has been proposed. The current recruiter must call `propose_recruiter_transfer()` first. |
+| `referrer already exists` | `add_referrer` | This referrer address is already in the recognized list. |
+| `referrer not found` | `remove_referrer` | This referrer address is not in the recognized list. |
+
+### Batch Operations
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `EmptyIndices` | `batch_confirm_milestones` | The `milestone_indices` vector is empty. Provide at least one milestone index. |
+| `too many IDs` | `batch_get_engagement_summary` | More than 20 engagement IDs requested in a single batch. Paginate or reduce the batch size. |
+| `EmptyConfigs` | `batch_create_engagements` | The `configs` vector is empty. Provide at least one engagement configuration. |
+| `TooManyEngagements` | `batch_create_engagements` | More than 20 engagements in a single batch (issue #260 limit). Split into multiple batches or create individually. |
+
+### Confirm Window & Force Confirm
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `ConfirmWindowNotElapsed` | `force_confirm_milestone` | The confirm window has not elapsed since the proof was submitted. Wait for the admin-configured window (default ~5 days) before force-confirming. |
+| `milestone is not in ProofSubmitted status` | `force_confirm_milestone` | The milestone has already transitioned (e.g. to `Confirmed` or `Disputed`). Can only force-confirm from `ProofSubmitted`. |
+
+### Scheduled Auto-Confirm
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `ScheduledLedgerInPast` | `schedule_auto_confirm` | The target ledger is not in the future. Schedule for a future ledger. |
+| `NoScheduledAutoConfirm` | `execute_scheduled_auto_confirm` or `cancel_scheduled_auto_confirm` | No scheduled auto-confirm exists for this milestone. Check with `get_scheduled_auto_confirm()` before executing or canceling. |
+| `ScheduledLedgerNotReached` | `execute_scheduled_auto_confirm` | The current ledger has not yet reached the scheduled target ledger. Wait or check `get_scheduled_auto_confirm()`. |
+
+### Upgrade
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `no pending upgrade` | `execute_upgrade` | No upgrade proposal is pending. The admin must call `propose_upgrade()` first. |
+| `UpgradeLockNotElapsed` | `execute_upgrade` | The time-lock period has not elapsed since the proposal. Wait for the admin-configured lock duration (default ~1 day). |
+
+### Rating & Visibility
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `EngagementNotCompleted` | `submit_recruiter_rating` or `submit_company_rating` | The engagement is not yet in `Completed` status. Ratings can only be submitted after an engagement completes. |
+| `InvalidRating` | `submit_recruiter_rating` or `submit_company_rating` | Rating is not in the range 1–5. Provide a rating between 1 (worst) and 5 (best). |
+| `AlreadyRated` | `submit_recruiter_rating` or `submit_company_rating` | A rating for this engagement has already been submitted by this party. Each side may rate once per engagement. Check `is_recruiter_rated()` / `is_company_rated()` first. |
+| `NewTagSameAsOld` | `rename_engagement_tag` | The new tag name is identical to the old tag name. Provide a different tag name. |
+| `TagNotFound` | `rename_engagement_tag` | The old tag has no engagements indexed under it. |
+| `TagEmpty` | `rename_engagement_tag` or `add_engagement_tag` | The tag string is empty. Provide a non-empty tag. |
+| `TagTooLong` | `rename_engagement_tag` or `add_engagement_tag` | The tag exceeds 32 characters. Shorten the tag. |
+
+### Reorder Milestones
+
+| Message | Triggered by | Condition |
+|---|---|---|
+| `InvalidReorderLength` | `reorder_milestones` | The `new_order` vector length does not match the number of milestones. |
+| `DuplicateReorderIndex` | `reorder_milestones` | The `new_order` is not a valid permutation (an index appears more than once). |
+| `CannotReorderProgressedMilestone` | `reorder_milestones` | Attempted to move a milestone that is `ProofSubmitted`, `Confirmed`, `Disputed`, or `Resolved`. Only `Locked`/`Pending` milestones (pre-activation) can be reordered. |
 
 ---
 
@@ -1090,7 +2829,13 @@ MIT
 
 ---
 
-## Function: `confirm_milestone`
+## Handsoff notes
 
-Called by the hiring **company** to confirm a `ProofSubmitted` milestone. Releases the milestone payment from escrow, splits off the platform fee, and re-checks retention timing. Panics on unauthorized caller or invalid milestone state. Emits `milestone_confirmed`, `platform_fee_collected`, and (on final milestone) `engagement_completed`.
+<!-- handsoff-issue-579 -->
+- #579: feat: get_engagements_by_created_range query — filter by creation ledger
 
+<!-- handsoff-issue-580 -->
+- #580: feat: recruiter profile aggregate query
+
+<!-- handsoff-issue-582 -->
+- #582: feat: get_protocol_stats query — global totals for dashboards
