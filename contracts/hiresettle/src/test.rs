@@ -8541,3 +8541,215 @@ fn test_escrow_callback_checkpoint_emits_when_enabled_and_target_set() {
 
     assert!(has_event(&env, "escrow_callback_point"));
 }
+
+// ============================================================
+// CONFIG CHANGE PROPOSALS (CO-SIGNED ADMIN FUNCTIONS)
+// ============================================================
+
+/// Default config change TTL is 17_280 ledgers (~1 day).
+#[test]
+fn test_get_config_change_ttl_default() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_config_change_ttl(), 17_280u32);
+}
+
+/// Admin can set the config change TTL.
+#[test]
+fn test_set_config_change_ttl() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_config_change_ttl(&company, &50_000u32);
+    assert_eq!(client.get_config_change_ttl(), 50_000u32);
+}
+
+/// Non-admin cannot set config change TTL.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_config_change_ttl_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_config_change_ttl(&recruiter, &50_000u32);
+}
+
+/// Admin can propose a config change.
+#[test]
+fn test_propose_config_change() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    assert_eq!(change_id, 1u32);
+
+    let proposal = client.get_pending_config_change(&change_id);
+    assert!(proposal.is_some());
+    let p = proposal.unwrap();
+    assert_eq!(p.change_id, 1u32);
+    assert_eq!(p.proposer, company);
+    assert_eq!(p.cancelled, false);
+    assert!(p.expires_at_ledger > 100); // sequence starts at 100
+}
+
+/// Non-admin cannot propose a config change.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_propose_config_change_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.propose_config_change(&recruiter);
+}
+
+/// Admin can accept their own config change proposal.
+#[test]
+fn test_accept_config_change() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    client.accept_config_change(&company, &change_id);
+
+    // Proposal should be removed after acceptance
+    assert!(client.get_pending_config_change(&change_id).is_none());
+    assert!(has_event(&env, "config_change_accepted"));
+}
+
+/// Accepting an expired proposal panics with ConfigChangeExpired.
+#[test]
+#[should_panic(expected = "ConfigChangeExpired")]
+fn test_accept_config_change_expired_panics() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Set a short TTL
+    client.set_config_change_ttl(&company, &10u32);
+
+    let change_id = client.propose_config_change(&company);
+
+    // Advance past the expiry
+    advance_ledger(&env, 20);
+
+    client.accept_config_change(&company, &change_id);
+}
+
+/// Accepting an expired proposal emits config_change_expired event.
+#[test]
+fn test_accept_config_change_expired_emits_event() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Set a short TTL
+    client.set_config_change_ttl(&company, &10u32);
+
+    let change_id = client.propose_config_change(&company);
+
+    // Advance past the expiry
+    advance_ledger(&env, 20);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.accept_config_change(&company, &change_id);
+    }));
+
+    assert!(result.is_err());
+    assert!(has_event(&env, "config_change_expired"));
+}
+
+/// Non-admin cannot accept a config change.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_accept_config_change_non_admin_rejected() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    client.accept_config_change(&recruiter, &change_id);
+}
+
+/// Admin can cancel their own config change proposal.
+#[test]
+fn test_cancel_config_change() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    client.cancel_config_change(&company, &change_id);
+
+    let proposal = client.get_pending_config_change(&change_id);
+    assert!(proposal.is_some());
+    assert_eq!(proposal.unwrap().cancelled, true);
+    assert!(has_event(&env, "config_change_cancelled"));
+}
+
+/// Non-admin cannot cancel a config change.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_cancel_config_change_non_admin_rejected() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    client.cancel_config_change(&recruiter, &change_id);
+}
+
+/// Accepting a cancelled proposal panics with ConfigChangeCancelled.
+#[test]
+#[should_panic(expected = "ConfigChangeCancelled")]
+fn test_accept_config_change_cancelled_panics() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    client.cancel_config_change(&company, &change_id);
+
+    client.accept_config_change(&company, &change_id);
+}
+
+/// Accepting a cancelled proposal emits config_change_cancelled event and removes it.
+#[test]
+fn test_accept_config_change_cancelled_emits_event() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let change_id = client.propose_config_change(&company);
+    client.cancel_config_change(&company, &change_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.accept_config_change(&company, &change_id);
+    }));
+
+    assert!(result.is_err());
+    assert!(has_event(&env, "config_change_cancelled"));
+
+    // Proposal should be removed after attempted acceptance
+    assert!(client.get_pending_config_change(&change_id).is_none());
+}
+
+/// Config change proposals are auto-incremented.
+#[test]
+fn test_config_change_id_auto_increment() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let id1 = client.propose_config_change(&company);
+    let id2 = client.propose_config_change(&company);
+    let id3 = client.propose_config_change(&company);
+
+    assert_eq!(id1, 1u32);
+    assert_eq!(id2, 2u32);
+    assert_eq!(id3, 3u32);
+}
+
+/// Config snapshot includes config_change_ttl_ledgers.
+#[test]
+fn test_config_snapshot_includes_config_change_ttl() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_config_change_ttl(&company, &50_000u32);
+
+    let snapshot = client.get_config_snapshot();
+    assert_eq!(snapshot.config_change_ttl_ledgers, 50_000u32);
+}

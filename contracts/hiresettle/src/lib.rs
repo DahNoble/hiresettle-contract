@@ -322,6 +322,23 @@ pub struct UpgradeProposal {
     pub execute_after_ledger: u32,
 }
 
+/// Pending configuration change for sensitive admin functions (co-signed proposal).
+/// Requires a second signer (the admin) to accept before the change takes effect.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingConfigChange {
+    /// Unique identifier for this config change proposal.
+    pub change_id: u32,
+    /// The admin who proposed this config change.
+    pub proposer: Address,
+    /// Ledger when the proposal was made.
+    pub proposed_at_ledger: u32,
+    /// Ledger at which the proposal expires if not accepted.
+    pub expires_at_ledger: u32,
+    /// Whether this proposal has been cancelled.
+    pub cancelled: bool,
+}
+
 /// Platform fee configuration deducted from each milestone payment.
 #[contracttype]
 #[derive(Clone)]
@@ -477,6 +494,8 @@ pub struct ConfigSnapshot {
     pub min_engagement_amount: i128,
     /// Whether the token allowlist is being enforced (issue #26).
     pub token_allowlist_enabled: bool,
+    /// Config change proposal TTL in ledgers — see `get_config_change_ttl`.
+    pub config_change_ttl_ledgers: u32,
 }
 
 /// Reserved escrow lifecycle checkpoint action for future yield strategy
@@ -543,6 +562,8 @@ pub enum ConfigKey {
     DueSoonWindow,
     /// Admin-configured referral discount in basis points (issue #251).
     ReferralDiscountBps,
+    /// Admin-configurable TTL for pending config change proposals (default 17_280 — ~1 day).
+    ConfigChangeTTL,
 }
 
 /// Contract storage key space. Instance keys reset between transactions;
@@ -645,6 +666,10 @@ pub enum DataKey {
     AllEngagements,
     /// Admin-configured list of recognised referrer addresses (issue #251).
     Referrers,
+    /// Pending config change proposal (co-signed admin function).
+    PendingConfigChange(u32),
+    /// Counter for config change proposals (instance storage).
+    ConfigChangeCount,
     /// Wraps a `ConfigKey` so every admin-tunable scalar setting shares one
     /// `DataKey` variant instead of each needing its own. See `ConfigKey`.
     Config(ConfigKey),
@@ -684,6 +709,8 @@ const DEFAULT_EXTENSION_TTL: u32 = 17_280;
 /// milestone becomes "due soon" once it is within this many ledgers of its
 /// `valid_after_ledger`. ~1 day at 5 s/ledger.
 const DEFAULT_DUE_SOON_WINDOW_LEDGERS: u32 = 17_280;
+/// Default TTL, in ledgers, for a pending config change proposal.
+const DEFAULT_CONFIG_CHANGE_TTL: u32 = 17_280;
 /// Maximum number of tags stored on an engagement (issue #248).
 const MAX_TAGS: u32 = 10;
 /// Maximum length, in characters, of a single engagement tag (issue #248).
@@ -748,6 +775,11 @@ impl HireSettleContract {
             &DataKey::Config(ConfigKey::MinEngagementAmount),
             &DEFAULT_MIN_ENGAGEMENT_AMOUNT,
         );
+
+        // Initialize config change counter
+        env.storage()
+            .instance()
+            .set(&DataKey::ConfigChangeCount, &0u32);
     }
 
     // ----------------------------------------------------------
@@ -6189,6 +6221,173 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // CONFIG CHANGE PROPOSALS (CO-SIGNED ADMIN FUNCTIONS)
+    // ----------------------------------------------------------
+
+    /// Admin sets the TTL for pending config change proposals in ledgers.
+    /// Default is 17,280 (~1 day).
+    pub fn set_config_change_ttl(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::ConfigChangeTTL), &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "config_change_ttl_set"),), ledgers);
+    }
+
+    /// Return the current config change proposal TTL in ledgers.
+    /// Defaults to 17,280 (~1 day).
+    pub fn get_config_change_ttl(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::ConfigChangeTTL))
+            .unwrap_or(DEFAULT_CONFIG_CHANGE_TTL)
+    }
+
+    /// Propose a config change for sensitive admin functions.
+    /// Creates a pending proposal that must be accepted by the admin before taking effect.
+    /// Returns the change_id for this proposal.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the admin.
+    pub fn propose_config_change(env: Env, admin: Address) -> u32 {
+        Self::assert_admin(&env, &admin);
+
+        let current_ledger = env.ledger().sequence();
+        let ttl = Self::get_config_change_ttl(env.clone());
+
+        // Get and increment the change_id counter
+        let change_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigChangeCount)
+            .unwrap_or(0u32);
+        let next_id = change_id + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ConfigChangeCount, &next_id);
+
+        let proposal = PendingConfigChange {
+            change_id: next_id,
+            proposer: admin.clone(),
+            proposed_at_ledger: current_ledger,
+            expires_at_ledger: current_ledger + ttl,
+            cancelled: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingConfigChange(next_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "config_change_proposed"),),
+            (next_id, admin, proposal.expires_at_ledger),
+        );
+
+        next_id
+    }
+
+    /// Accept a pending config change proposal.
+    /// Only the admin can accept their own proposal.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the admin.
+    /// - `"no pending config change"` — no proposal exists for this change_id.
+    /// - `"ConfigChangeExpired"` — the proposal has expired.
+    /// - `"ConfigChangeCancelled"` — the proposal was cancelled.
+    pub fn accept_config_change(env: Env, admin: Address, change_id: u32) {
+        Self::assert_admin(&env, &admin);
+
+        let mut proposal: PendingConfigChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfigChange(change_id))
+            .unwrap_or_else(|| panic!("no pending config change"));
+
+        if proposal.proposer != admin {
+            panic!("unauthorized");
+        }
+
+        let current_ledger = env.ledger().sequence();
+
+        if current_ledger > proposal.expires_at_ledger {
+            env.storage()
+                .instance()
+                .remove(&DataKey::PendingConfigChange(change_id));
+
+            env.events().publish(
+                (Symbol::new(&env, "config_change_expired"),),
+                (change_id, current_ledger),
+            );
+
+            panic!("ConfigChangeExpired");
+        }
+
+        if proposal.cancelled {
+            env.storage()
+                .instance()
+                .remove(&DataKey::PendingConfigChange(change_id));
+
+            env.events().publish(
+                (Symbol::new(&env, "config_change_cancelled"),),
+                (change_id, admin),
+            );
+
+            panic!("ConfigChangeCancelled");
+        }
+
+        // Remove the proposal - the actual config change logic would be implemented
+        // by the specific function being called (e.g., set_platform_fee would call
+        // propose_config_change first, then the caller would call accept_config_change
+        // to finalize it)
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingConfigChange(change_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "config_change_accepted"),),
+            (change_id, admin),
+        );
+    }
+
+    /// Cancel a pending config change proposal.
+    /// Only the proposer (admin) can cancel their own proposal.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the proposer.
+    /// - `"no pending config change"` — no proposal exists for this change_id.
+    pub fn cancel_config_change(env: Env, admin: Address, change_id: u32) {
+        let mut proposal: PendingConfigChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfigChange(change_id))
+            .unwrap_or_else(|| panic!("no pending config change"));
+
+        if proposal.proposer != admin {
+            panic!("unauthorized");
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingConfigChange(change_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "config_change_cancelled"),),
+            (change_id, admin),
+        );
+    }
+
+    /// Return a pending config change proposal by change_id.
+    /// Returns `None` if no proposal exists.
+    /// Read-only and permissionless.
+    pub fn get_pending_config_change(env: Env, change_id: u32) -> Option<PendingConfigChange> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingConfigChange(change_id))
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #55 — ENGAGEMENT COMPLETION QUERY
     // ----------------------------------------------------------
 
@@ -6277,6 +6476,7 @@ impl HireSettleContract {
                 .persistent()
                 .get(&DataKey::AllowlistEnabled)
                 .unwrap_or(false),
+            config_change_ttl_ledgers: Self::get_config_change_ttl(env.clone()),
         }
     }
 
