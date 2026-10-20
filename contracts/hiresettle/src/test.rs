@@ -10774,6 +10774,7 @@ fn test_timeline_matches_underlying_histories() {
                 raised_by: company.clone(),
                 reason: String::from_str(&env, "bad"),
                 ledger: 120,
+                withdrawn_at: None,
             },
         ]
     );

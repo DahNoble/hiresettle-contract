@@ -372,6 +372,12 @@ impl HireSettleContract {
                             record.voted.set(j, nominee.clone());
                         }
                     }
+                    // Issue #559: the seat keeps its used vote change too.
+                    for j in 0..record.changed.len() {
+                        if record.changed.get(j).unwrap() == nomination.current {
+                            record.changed.set(j, nominee.clone());
+                        }
+                    }
                     env.storage().persistent().set(&vote_key, &record);
                 }
                 // Same seat migration for split votes (issue #462).
