@@ -452,6 +452,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
+            // Issue #578: payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             let token_client = token::Client::new(&env, &engagement.token);
             if fee_amount > 0 {
@@ -541,6 +543,326 @@ impl HireSettleContract {
                 ),
             );
         }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #550 — PARTIAL MILESTONE CONFIRMATION
+    // ----------------------------------------------------------
+
+    /// Company proposes releasing only `release_bps` of a `ProofSubmitted`
+    /// milestone, for partially delivered work, without raising a dispute.
+    /// The recruiter accepts with [`Self::accept_partial_confirmation`] or
+    /// declines with [`Self::reject_partial_confirmation`]. A new proposal on
+    /// the same milestone replaces the pending one.
+    ///
+    /// The proposal expires after the amendment TTL (`get_amendment_ttl`) and
+    /// only applies to the proof it was made against.
+    ///
+    /// # Panics
+    /// - `"InvalidReleaseBps"` — `release_bps` exceeds 10 000.
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"unauthorized"` — caller is not the engagement's company or co-signer.
+    /// - `"invalid milestone index"` — `milestone_index` is out of bounds.
+    /// - `"milestone proof not yet submitted"` — milestone is not `ProofSubmitted`.
+    ///
+    /// # Events
+    /// `("partial_confirmation_proposed", engagement_id)` with
+    /// `(milestone_index, release_bps, expires_at_ledger)`.
+    pub fn propose_partial_confirmation(
+        env: Env,
+        company: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        release_bps: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
+        company.require_auth();
+
+        if release_bps > FULL_SPLIT_BPS {
+            panic!("InvalidReleaseBps");
+        }
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+        if milestone.status != MilestoneStatus::ProofSubmitted {
+            panic!("milestone proof not yet submitted");
+        }
+
+        let now = env.ledger().sequence();
+        let proposal = PartialConfirmationProposal {
+            proposer: company,
+            release_bps,
+            proof_submitted_at: milestone.proof_submitted_at,
+            proposed_at_ledger: now,
+            expires_at_ledger: now.saturating_add(Self::get_amendment_ttl(env.clone())),
+        };
+        let key = DataKey2::PartialConfirmationProposal(engagement_id.clone(), milestone_index);
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "partial_confirmation_proposed"),
+                engagement_id,
+            ),
+            (milestone_index, release_bps, proposal.expires_at_ledger),
+        );
+    }
+
+    /// Recruiter accepts a pending partial confirmation. `release_bps` of the
+    /// milestone amount is paid through the normal fee pipeline (platform fee,
+    /// referrer share, streaming, co-recruiter split, pull payouts), the rest
+    /// is refunded to the company, and the milestone becomes `Confirmed`.
+    ///
+    /// The milestone amount is the same `payment` `confirm_milestone` would
+    /// release (net of any `replacement_paid_out`); released + refunded always
+    /// equal it exactly.
+    ///
+    /// # Panics
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"unauthorized"` — caller is not the recruiter or recruiter co-signer.
+    /// - `"no pending partial confirmation"` — nothing to accept.
+    /// - `"PartialConfirmationExpired"` — the proposal outlived the amendment TTL.
+    /// - `"milestone proof not yet submitted"` — the milestone left
+    ///   `ProofSubmitted`, or the proof changed, since the proposal was made.
+    /// - `"PreviousMilestoneNotComplete"` / `"retention window has not elapsed
+    ///   — cannot confirm yet"` — same gates as `confirm_milestone`.
+    ///
+    /// # Events
+    /// - `("partial_confirmation_accepted", engagement_id)` with
+    ///   `(milestone_index, release_bps, released, refunded)`.
+    /// - `("milestone_confirmed", engagement_id)` with `(milestone_index, released)`.
+    /// - The usual status-change / `engagement_completed` events.
+    pub fn accept_partial_confirmation(
+        env: Env,
+        recruiter: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
+        recruiter.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey2::PartialConfirmationProposal(engagement_id.clone(), milestone_index);
+        let proposal: PartialConfirmationProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending partial confirmation"));
+        if env.ledger().sequence() > proposal.expires_at_ledger {
+            panic!("PartialConfirmationExpired");
+        }
+
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+        if milestone.status != MilestoneStatus::ProofSubmitted
+            || milestone.proof_submitted_at != proposal.proof_submitted_at
+        {
+            panic!("milestone proof not yet submitted");
+        }
+        Self::assert_prerequisites_complete(&engagement, &milestone);
+        if milestone.kind == MilestoneKind::Retention
+            && env.ledger().sequence() < milestone.valid_after_ledger
+        {
+            panic!("retention window has not elapsed — cannot confirm yet");
+        }
+
+        env.storage().persistent().remove(&key);
+
+        let full_share = (engagement.total_amount * milestone.payment_percent as i128) / 100;
+        let payment = full_share - milestone.replacement_paid_out;
+        let mut released: i128 = 0;
+        let mut refunded: i128 = 0;
+        if payment > 0 {
+            released = (payment * proposal.release_bps as i128) / (FULL_SPLIT_BPS as i128);
+            refunded = payment - released;
+            engagement.released_amount += payment;
+
+            let token_client = token::Client::new(&env, &engagement.token);
+            if released > 0 {
+                let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
+                let fee_amount =
+                    Self::platform_fee_amount(&env, &engagement_id, released, effective_bps);
+                let net_payment = released - fee_amount;
+                if fee_amount > 0 {
+                    Self::collect_platform_fee(
+                        &env,
+                        &engagement,
+                        &engagement_id,
+                        milestone_index,
+                        fee_amount,
+                    );
+                }
+                match engagement.stream_duration_ledgers {
+                    Some(duration) => Self::start_streamed_payout(
+                        &env,
+                        &engagement_id,
+                        milestone_index,
+                        net_payment,
+                        duration,
+                    ),
+                    None => Self::distribute_recruiter_payout(
+                        &env,
+                        &engagement,
+                        net_payment,
+                        &token_client,
+                        true,
+                    ),
+                }
+            }
+            if refunded > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &engagement.company,
+                    &refunded,
+                );
+            }
+        }
+
+        let old_status = milestone.status.clone();
+        milestone.status = MilestoneStatus::Confirmed;
+        engagement.milestones.set(milestone_index, milestone);
+        Self::bond_clear_rejection(&env, &engagement_id, milestone_index);
+
+        let all_done = (0..engagement.milestones.len()).all(|i| {
+            let s = engagement.milestones.get(i).unwrap().status;
+            s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
+        });
+        let old_engagement_status = engagement.status.clone();
+        if all_done {
+            engagement.status = EngagementStatus::Completed;
+            Self::settle_bonds(&env, &engagement);
+            Self::refund_no_show_forfeit(&env, &engagement_id, &engagement);
+            Self::decrement_company_active_count(&env, &engagement.company);
+            Self::refund_split_withheld(&env, &engagement_id, &mut engagement);
+        }
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Confirmed,
+        );
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+            Some(recruiter.clone()),
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "partial_confirmation_accepted"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, proposal.release_bps, released, refunded),
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_confirmed"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, released),
+        );
+        if all_done {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "engagement_completed"),
+                    engagement_id.clone(),
+                ),
+                (
+                    engagement_id.clone(),
+                    engagement.released_amount,
+                    env.ledger().sequence(),
+                ),
+            );
+        }
+    }
+
+    /// Recruiter declines a pending partial confirmation. The proposal is
+    /// discarded and the milestone stays `ProofSubmitted`, so the company can
+    /// still confirm in full, raise a dispute, or propose again.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the recruiter or recruiter co-signer.
+    /// - `"no pending partial confirmation"` — nothing to reject.
+    ///
+    /// # Events
+    /// `("partial_confirmation_rejected", engagement_id)` with
+    /// `(milestone_index, release_bps)`.
+    pub fn reject_partial_confirmation(
+        env: Env,
+        recruiter: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        recruiter.require_auth();
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey2::PartialConfirmationProposal(engagement_id.clone(), milestone_index);
+        let proposal: PartialConfirmationProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending partial confirmation"));
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "partial_confirmation_rejected"),
+                engagement_id,
+            ),
+            (milestone_index, proposal.release_bps),
+        );
+    }
+
+    /// Return the pending partial confirmation for a milestone, or `None` if
+    /// there is none or it has expired.
+    pub fn get_pending_partial_confirmation(
+        env: Env,
+        engagement_id: String,
+        milestone_index: u32,
+    ) -> Option<PartialConfirmationProposal> {
+        let proposal: PartialConfirmationProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::PartialConfirmationProposal(engagement_id, milestone_index))?;
+        if env.ledger().sequence() > proposal.expires_at_ledger {
+            return None;
+        }
+        Some(proposal)
     }
 
     // ----------------------------------------------------------
@@ -646,6 +968,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
+            // Issue #578: payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             if fee_amount > 0 {
                 Self::collect_platform_fee(&env, &engagement, &engagement_id, idx, fee_amount);

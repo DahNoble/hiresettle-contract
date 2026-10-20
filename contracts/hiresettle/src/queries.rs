@@ -94,6 +94,27 @@ impl HireSettleContract {
         engagement.total_amount - engagement.released_amount
     }
 
+    /// Total value locked for `token` (issue #578): the running sum of
+    /// `total_amount - released_amount` over that token's engagements,
+    /// maintained incrementally on funding, top-up and every payout, so it
+    /// always equals the sum of `get_escrow_balance` across those
+    /// engagements. Never negative (clamped at zero). Read-only.
+    pub fn get_token_tvl(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::TokenLocked(token))
+            .unwrap_or(0)
+    }
+
+    /// Total pooled company balances held for `token` (issue #472 pots),
+    /// tracked separately from engagement escrow (issue #578). Read-only.
+    pub fn get_token_pooled_balance(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::TokenPooled(token))
+            .unwrap_or(0)
+    }
+
     /// Returns `true` if the milestone is `Locked` and the current ledger
     /// sequence is greater than or equal to its `valid_after_ledger`, meaning
     /// it can currently be unlocked via `unlock_milestone`.
@@ -200,6 +221,21 @@ impl HireSettleContract {
     /// that derived value.
     pub fn get_total_released(env: Env, engagement_id: String) -> i128 {
         Self::get_engagement_internal(&env, &engagement_id).released_amount
+    }
+
+    /// Return a party's cross-engagement dispute counters (issue #581):
+    /// disputes raised/won/lost plus escalations. All zeros for an address
+    /// with no recorded dispute activity. Read-only, permissionless.
+    pub fn get_party_dispute_stats(env: Env, party: Address) -> DisputeStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::PartyDisputeStats(party))
+            .unwrap_or(DisputeStats {
+                disputes_raised: 0,
+                disputes_won: 0,
+                disputes_lost: 0,
+                escalations: 0,
+            })
     }
 
     /// Return a lightweight summary of an engagement, suitable for list/dashboard views.
@@ -324,6 +360,50 @@ impl HireSettleContract {
             .storage()
             .persistent()
             .get(&DataKey::TagEngagements(tag))
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.len()
+    }
+
+    /// Return a paginated slice of engagement IDs denominated in `token`
+    /// (issue #577), for treasury and analytics dashboards. `page` is
+    /// 0-indexed; out-of-range pages return an empty vec. Forward-only: only
+    /// engagements created after this index was introduced are listed.
+    pub fn get_engagements_by_token(
+        env: Env,
+        token: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<String> {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TokenEngagements(token))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = ids.len();
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(ids.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Return the total number of engagements denominated in `token`
+    /// (issue #577). Companion to `get_engagements_by_token` for sizing
+    /// pagination. Returns `0` for a token with no indexed engagements.
+    pub fn get_engagement_count_by_token(env: Env, token: Address) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TokenEngagements(token))
             .unwrap_or_else(|| Vec::new(&env));
         ids.len()
     }

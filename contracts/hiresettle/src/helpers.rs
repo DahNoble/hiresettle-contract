@@ -557,6 +557,37 @@ impl HireSettleContract {
     /// The refund is added to `released_amount` so `total_amount -
     /// released_amount` keeps reporting the true escrow balance, and is capped
     /// at that balance so it can never over-draw escrow and block completion.
+    // ----------------------------------------------------------
+    // ISSUE #578 — TOKEN TVL AND POOLED BALANCE AGGREGATES
+    // ----------------------------------------------------------
+
+    /// Running total of engagement escrow locked per token, i.e. the sum of
+    /// `total_amount - released_amount` over that token's engagements.
+    /// Bumped at every mutation of those fields (funding, top-up, payouts)
+    /// so it always matches that sum. Clamped at zero: never negative.
+    pub(crate) fn add_token_locked(env: &Env, token: &Address, delta: i128) {
+        let key = DataKey2::TokenLocked(token.clone());
+        let locked: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = locked.saturating_add(delta).max(0);
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    /// Running total of pooled company balances per token (issue #472 pots),
+    /// tracked separately from engagement escrow. Read via
+    /// `get_token_pooled_balance`.
+    pub(crate) fn add_token_pooled(env: &Env, token: &Address, delta: i128) {
+        let key = DataKey2::TokenPooled(token.clone());
+        let pooled: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = pooled.saturating_add(delta).max(0);
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
     pub(crate) fn refund_split_withheld(
         env: &Env,
         engagement_id: &String,
@@ -573,6 +604,8 @@ impl HireSettleContract {
             return;
         }
         engagement.released_amount += withheld;
+        // Issue #578: escrow shrank by the refunded remainder.
+        Self::add_token_locked(env, &engagement.token, -withheld);
         token::Client::new(env, &engagement.token).transfer(
             &env.current_contract_address(),
             &engagement.company,
@@ -605,6 +638,9 @@ impl HireSettleContract {
     /// On a `pull_payouts` engagement (issue #547) each share is credited to
     /// the payee's claimable balance in the escrow token instead, so nothing
     /// is transferred and no payout token preference is applied.
+    ///
+    /// Transferred shares go to each payee's payout destination when one is
+    /// set (issue #548); credited shares are sent there by `claim_payouts`.
     pub(crate) fn distribute_recruiter_payout(
         env: &Env,
         engagement: &Engagement,
@@ -625,7 +661,11 @@ impl HireSettleContract {
             } else if apply_payout_preference {
                 Self::pay_recruiter_share(env, token_client, recipient, amount);
             } else {
-                token_client.transfer(&env.current_contract_address(), recipient, &amount);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &Self::recruiter_payout_destination(env, recipient),
+                    &amount,
+                );
             }
         };
         match &engagement.co_recruiter {

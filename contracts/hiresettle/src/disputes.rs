@@ -272,125 +272,79 @@ impl HireSettleContract {
             (Symbol::new(env, "dispute_raised"), engagement_id.clone()),
             (milestone_index, reason.clone()),
         );
+
+        // Issue #581: count the newly raised dispute against the company.
+        Self::record_dispute_raised_party(env, &engagement.company);
     }
 
     // ----------------------------------------------------------
-    // ISSUE #565 — DISPUTE WITHDRAWAL
+    // ISSUE #581 — DISPUTE STATISTICS PER PARTY
     // ----------------------------------------------------------
 
-    /// The company withdraws a dispute it raised, as long as no arbiter has
-    /// voted on it yet. The milestone returns to `ProofSubmitted` with its
-    /// confirm (and dispute) window restarted from the withdrawal ledger, so
-    /// the company can still confirm and `force_confirm_milestone` cannot
-    /// fire immediately.
-    ///
-    /// The withdrawn dispute still counts toward the milestone's dispute
-    /// cycle cap (issue #481) and stays in `get_dispute_history` with its
-    /// `withdrawn_at` ledger set (issue #501).
-    ///
-    /// # Panics
-    /// - `"EngagementPaused"` — the engagement has been paused by the admin.
-    /// - `"engagement not found"` / `"engagement is not active"` /
-    ///   `"unauthorized"` — same as `raise_dispute`.
-    /// - `"invalid milestone index"`.
-    /// - `"milestone is not in disputed status"`.
-    /// - `"VotesAlreadyCast"` — any binary, split or super-arbiter panel vote
-    ///   has been cast on the dispute.
-    ///
-    /// # Events
-    /// Emits `milestone_status_changed` (`Disputed` → `ProofSubmitted`) and
-    /// `("dispute_withdrawn", engagement_id)` with `milestone_index`.
-    pub fn withdraw_dispute(
-        env: Env,
-        company: Address,
-        engagement_id: String,
-        milestone_index: u32,
-    ) {
-        Self::assert_engagement_not_paused(&env, &engagement_id);
-        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
-        company.require_auth();
-
-        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-
-        if engagement.status != EngagementStatus::Active {
-            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
-        }
-
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
-            panic!("{}", ERR_UNAUTHORIZED);
-        }
-
-        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
-
-        if milestone.status != MilestoneStatus::Disputed {
-            panic!("milestone is not in disputed status");
-        }
-
-        let votes_cast = env
-            .storage()
-            .persistent()
-            .has(&DataKey::ArbiterVotes(engagement_id.clone(), milestone_index))
-            || env.storage().persistent().has(&DataKey2::ArbiterSplitVotes(
-                engagement_id.clone(),
-                milestone_index,
-            ))
-            || env.storage().persistent().has(&DataKey2::SuperArbiterVotes(
-                engagement_id.clone(),
-                milestone_index,
-            ));
-        if votes_cast {
-            panic!("VotesAlreadyCast");
-        }
-
-        let current_ledger = env.ledger().sequence();
-        milestone.status = MilestoneStatus::ProofSubmitted;
-        milestone.proof_submitted_at = current_ledger;
-        engagement.milestones.set(milestone_index, milestone);
-
-        // Clear the dispute's live state. `DisputeCycles` is deliberately left
-        // untouched so the withdrawal counts toward the cap (issue #481).
-        env.storage().persistent().remove(&DataKey::DisputeReason(
-            engagement_id.clone(),
-            milestone_index,
-        ));
-        env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
-            engagement_id.clone(),
-            milestone_index,
-        ));
-        env.storage().persistent().remove(&DataKey::EscalatedDispute(
-            engagement_id.clone(),
-            milestone_index,
-        ));
-        env.storage().persistent().remove(&DataKey::EscalatedAt(
-            engagement_id.clone(),
-            milestone_index,
-        ));
-        Self::clear_recused_arbiters(&env, &engagement_id, milestone_index);
-
-        Self::record_dispute_withdrawn(&env, &engagement_id, milestone_index);
-
-        engagement.last_activity_ledger = current_ledger;
+    /// Load a party's dispute counters, defaulting to all zeros.
+    fn load_party_dispute_stats(env: &Env, party: &Address) -> DisputeStats {
         env.storage()
             .persistent()
-            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
-        Self::extend_engagement_ttl(&env, &engagement_id);
-
-        Self::emit_milestone_status_changed(
-            &env,
-            &engagement_id,
-            milestone_index,
-            MilestoneStatus::Disputed,
-            MilestoneStatus::ProofSubmitted,
-        );
-        env.events().publish(
-            (Symbol::new(&env, "dispute_withdrawn"), engagement_id.clone()),
-            milestone_index,
-        );
+            .get(&DataKey2::PartyDisputeStats(party.clone()))
+            .unwrap_or(DisputeStats {
+                disputes_raised: 0,
+                disputes_won: 0,
+                disputes_lost: 0,
+                escalations: 0,
+            })
     }
 
-    // ----------------------------------------------------------
-    // CAST ARBITER VOTE  (#10 multi-arbiter quorum)
-    // ----------------------------------------------------------
+    fn store_party_dispute_stats(env: &Env, party: &Address, stats: &DisputeStats) {
+        let key = DataKey2::PartyDisputeStats(party.clone());
+        env.storage().persistent().set(&key, stats);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    /// Record a win (`won == true`) or loss for one party.
+    fn record_party_result(env: &Env, party: &Address, won: bool) {
+        let mut stats = Self::load_party_dispute_stats(env, party);
+        if won {
+            stats.disputes_won = stats.disputes_won.saturating_add(1);
+        } else {
+            stats.disputes_lost = stats.disputes_lost.saturating_add(1);
+        }
+        Self::store_party_dispute_stats(env, party, &stats);
+    }
+
+    /// Record a dispute outcome for both sides of an engagement.
+    /// `recruiter_won == true` means the milestone paid out (approve path);
+    /// `false` means it was withheld (reject path). The co-recruiter, when
+    /// present, is counted alongside the primary recruiter.
+    pub(crate) fn record_dispute_outcome(env: &Env, engagement: &Engagement, recruiter_won: bool) {
+        Self::record_party_result(env, &engagement.company, !recruiter_won);
+        Self::record_party_result(env, &engagement.recruiter, recruiter_won);
+        if let Some(co) = &engagement.co_recruiter {
+            Self::record_party_result(env, co, recruiter_won);
+        }
+    }
+
+    /// Count a newly raised dispute against the raising company.
+    pub(crate) fn record_dispute_raised_party(env: &Env, company: &Address) {
+        let mut stats = Self::load_party_dispute_stats(env, company);
+        stats.disputes_raised = stats.disputes_raised.saturating_add(1);
+        Self::store_party_dispute_stats(env, company, &stats);
+    }
+
+    /// Count an escalation against every party to the engagement.
+    pub(crate) fn record_dispute_escalation(env: &Env, engagement: &Engagement) {
+        for party in [&engagement.company, &engagement.recruiter] {
+            let mut stats = Self::load_party_dispute_stats(env, party);
+            stats.escalations = stats.escalations.saturating_add(1);
+            Self::store_party_dispute_stats(env, party, &stats);
+        }
+        if let Some(co) = &engagement.co_recruiter {
+            let mut stats = Self::load_party_dispute_stats(env, co);
+            stats.escalations = stats.escalations.saturating_add(1);
+            Self::store_party_dispute_stats(env, co, &stats);
+        }
+    }
 
     /// Each arbiter calls this to cast their vote on a Disputed milestone.
     /// The dispute resolves automatically once either:
@@ -527,9 +481,12 @@ impl HireSettleContract {
                 payment,
                 Some(arbiter),
             );
-            Self::finish_dispute_resolved(env, engagement, engagement_id, milestone_index, caller);
+            // Issue #581: approve pays out — recruiter side wins.
+            Self::record_dispute_outcome(&env, &engagement, true);
         } else if record.reject_weight > total_weight - quorum {
-            Self::finish_dispute_rejected(env, engagement, engagement_id, milestone_index);
+            Self::finish_dispute_rejected(&env, &mut engagement, &engagement_id, milestone_index);
+            // Issue #581: reject withholds — company wins.
+            Self::record_dispute_outcome(&env, &engagement, false);
         } else {
             let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), milestone_index);
             env.storage().persistent().set(&vote_key, record);
@@ -677,6 +634,8 @@ impl HireSettleContract {
         arbiter: Option<&Address>,
     ) {
         engagement.released_amount += payment;
+        // Issue #578: dispute payout releases escrow.
+        Self::add_token_locked(env, &engagement.token, -payment);
 
         let effective_bps = Self::payout_fee_bps(env, engagement_id, engagement);
         let platform_fee_amount =
@@ -737,6 +696,13 @@ impl HireSettleContract {
             engagement_id.clone(),
             milestone_index,
         ));
+        // Issue #564: a vote outcome invalidates any pending settlement.
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::DisputeSettlementProposal(
+                engagement_id.clone(),
+                milestone_index,
+            ));
         // A rejected proof starts a new submission round, so do not make
         // the recruiter wait for the cooldown before replacing it.
         env.storage().persistent().remove(&DataKey::LastProofAt(
@@ -809,6 +775,12 @@ impl HireSettleContract {
             engagement_id.clone(),
             milestone_index,
         ));
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::DisputeSettlementProposal(
+                engagement_id.clone(),
+                milestone_index,
+            ));
         env.storage().persistent().remove(&DataKey::DisputeReason(
             engagement_id.clone(),
             milestone_index,
@@ -843,6 +815,227 @@ impl HireSettleContract {
             engagement.status.clone(),
             Some(actor.clone()),
         );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #564 — MUTUAL DISPUTE SETTLEMENT
+    // ----------------------------------------------------------
+
+    /// Company or recruiter side proposes settling a dispute without the
+    /// arbiters: `recruiter_bps` of the milestone goes to the recruiter, the
+    /// rest back to the company. The other side accepts with
+    /// [`Self::accept_dispute_settlement`]. A new proposal on the same dispute
+    /// replaces the pending one.
+    ///
+    /// `proposer` may be the company or its co-signer, or the recruiter or
+    /// its co-signer. The proposal only applies to the current dispute: it is
+    /// dropped when the dispute resolves by vote first, and can never settle
+    /// a later dispute on the same milestone.
+    ///
+    /// # Panics
+    /// - `"InvalidRecruiterBps"` — `recruiter_bps` exceeds 10 000.
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"unauthorized"` — caller is on neither side of the engagement.
+    /// - `"milestone is not in disputed status"` — the milestone isn't `Disputed`.
+    /// - `"DisputeEscalated"` — the dispute has been escalated to the super arbiter.
+    ///
+    /// # Events
+    /// `("dispute_settlement_proposed", engagement_id)` with
+    /// `(milestone_index, proposer, recruiter_bps)`.
+    pub fn propose_dispute_settlement(
+        env: Env,
+        proposer: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        recruiter_bps: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
+        proposer.require_auth();
+
+        if recruiter_bps > FULL_SPLIT_BPS {
+            panic!("InvalidRecruiterBps");
+        }
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+        let proposed_by_company =
+            if Self::is_authorized_company(&env, &proposer, &engagement.company) {
+                true
+            } else if Self::is_authorized_recruiter(&env, &proposer, &engagement.recruiter) {
+                false
+            } else {
+                panic!("{}", ERR_UNAUTHORIZED);
+            };
+        Self::assert_dispute_settleable(&env, &engagement, &engagement_id, milestone_index);
+
+        let proposal = DisputeSettlementProposal {
+            proposer: proposer.clone(),
+            proposed_by_company,
+            recruiter_bps,
+            dispute_cycle: Self::get_dispute_cycles(
+                env.clone(),
+                engagement_id.clone(),
+                milestone_index,
+            ),
+            proposed_at_ledger: env.ledger().sequence(),
+        };
+        let key = DataKey2::DisputeSettlementProposal(engagement_id.clone(), milestone_index);
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "dispute_settlement_proposed"),
+                engagement_id,
+            ),
+            (milestone_index, proposer, recruiter_bps),
+        );
+    }
+
+    /// The other side accepts a pending dispute settlement. `recruiter_bps`
+    /// of the milestone's share is paid to the recruiter(s) through the fee
+    /// pipeline with no arbiter fee, the remainder is refunded to the company,
+    /// the dispute's votes are cleared and the milestone becomes `Resolved`.
+    ///
+    /// # Panics
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"no pending dispute settlement"` — nothing to accept, or the dispute
+    ///   it was proposed for has since been resolved by vote.
+    /// - `"unauthorized"` — caller is not on the side opposite the proposer.
+    /// - `"milestone is not in disputed status"` / `"DisputeEscalated"` — the
+    ///   dispute is no longer open to settlement.
+    ///
+    /// # Events
+    /// - `("dispute_settled", engagement_id)` with
+    ///   `(milestone_index, recruiter_bps, released, refunded)`.
+    /// - The usual `dispute_resolved` / status-change events.
+    pub fn accept_dispute_settlement(
+        env: Env,
+        acceptor: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
+        acceptor.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let key = DataKey2::DisputeSettlementProposal(engagement_id.clone(), milestone_index);
+        let proposal: DisputeSettlementProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending dispute settlement"));
+
+        let is_counterparty = if proposal.proposed_by_company {
+            Self::is_authorized_recruiter(&env, &acceptor, &engagement.recruiter)
+        } else {
+            Self::is_authorized_company(&env, &acceptor, &engagement.company)
+        };
+        if !is_counterparty {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        Self::assert_dispute_settleable(&env, &engagement, &engagement_id, milestone_index);
+        if proposal.dispute_cycle
+            != Self::get_dispute_cycles(env.clone(), engagement_id.clone(), milestone_index)
+        {
+            panic!("no pending dispute settlement");
+        }
+
+        let milestone = engagement.milestones.get(milestone_index).unwrap();
+        let share = (engagement.total_amount * milestone.payment_percent as i128) / 100;
+        let released = (share * proposal.recruiter_bps as i128) / (FULL_SPLIT_BPS as i128);
+        let refunded = share - released;
+
+        if released > 0 {
+            // `None`: no arbiter decided this, so no arbiter fee is charged.
+            Self::release_dispute_payout(
+                &env,
+                &mut engagement,
+                &engagement_id,
+                milestone_index,
+                released,
+                None,
+            );
+        }
+        if refunded > 0 {
+            engagement.released_amount += refunded;
+            token::Client::new(&env, &engagement.token).transfer(
+                &env.current_contract_address(),
+                &engagement.company,
+                &refunded,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_settled"), engagement_id.clone()),
+            (milestone_index, proposal.recruiter_bps, released, refunded),
+        );
+        // Clears the vote tallies and the settlement proposal.
+        Self::finish_dispute_resolved(
+            &env,
+            &mut engagement,
+            &engagement_id,
+            milestone_index,
+            &acceptor,
+        );
+
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+    }
+
+    /// Return the pending settlement proposal for a disputed milestone, or
+    /// `None` if there is none or the dispute it was made for is over.
+    pub fn get_pending_dispute_settlement(
+        env: Env,
+        engagement_id: String,
+        milestone_index: u32,
+    ) -> Option<DisputeSettlementProposal> {
+        let proposal: DisputeSettlementProposal = env.storage().persistent().get(
+            &DataKey2::DisputeSettlementProposal(engagement_id.clone(), milestone_index),
+        )?;
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let disputed = engagement
+            .milestones
+            .get(milestone_index)
+            .is_some_and(|m| m.status == MilestoneStatus::Disputed);
+        let cycle = Self::get_dispute_cycles(env.clone(), engagement_id, milestone_index);
+        if !disputed || proposal.dispute_cycle != cycle {
+            return None;
+        }
+        Some(proposal)
+    }
+
+    /// Panics unless the milestone is `Disputed` and the dispute has not been
+    /// escalated to the super arbiter (issue #564).
+    fn assert_dispute_settleable(
+        env: &Env,
+        engagement: &Engagement,
+        engagement_id: &String,
+        milestone_index: u32,
+    ) {
+        let milestone = Self::get_milestone_or_panic(engagement, milestone_index);
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+        if Self::is_dispute_escalated(env.clone(), engagement_id.clone(), milestone_index) {
+            panic!("DisputeEscalated");
+        }
     }
 
     // ----------------------------------------------------------
@@ -1063,6 +1256,8 @@ impl HireSettleContract {
             ),
             (milestone_index, settled, released, withheld),
         );
+        // Issue #581: a majority-recruiter median counts as a recruiter win.
+        Self::record_dispute_outcome(env, engagement, settled >= 50);
         Self::finish_dispute_resolved(env, engagement, engagement_id, milestone_index, actor);
     }
 
@@ -1392,6 +1587,8 @@ impl HireSettleContract {
             &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
             &true,
         );
+        // Issue #581: count the escalation against every party.
+        Self::record_dispute_escalation(&env, &engagement);
         env.storage().persistent().extend_ttl(
             &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
             100_000,
@@ -1528,6 +1725,8 @@ impl HireSettleContract {
         if approve {
             let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
             engagement.released_amount += payment;
+            // Issue #578: dispute payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
             let platform_fee_amount =
@@ -1602,6 +1801,8 @@ impl HireSettleContract {
                 ),
                 (milestone_index, super_arbiter.clone(), true),
             );
+            // Issue #581: super arbiter approved — recruiter side wins.
+            Self::record_dispute_outcome(&env, &engagement, true);
             Self::emit_milestone_status_changed(
                 &env,
                 &engagement_id,
@@ -1656,6 +1857,8 @@ impl HireSettleContract {
                 ),
                 (milestone_index, super_arbiter.clone(), false),
             );
+            // Issue #581: super arbiter rejected — company wins.
+            Self::record_dispute_outcome(&env, &engagement, false);
             Self::emit_milestone_status_changed(
                 &env,
                 &engagement_id,
@@ -1764,6 +1967,8 @@ impl HireSettleContract {
 
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         engagement.released_amount += payment;
+        // Issue #578: dispute payout releases escrow.
+        Self::add_token_locked(&env, &engagement.token, -payment);
 
         let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
         let platform_fee_amount =
@@ -1823,6 +2028,8 @@ impl HireSettleContract {
             ),
             milestone_index,
         );
+        // Issue #581: timeout auto-favors the recruiter.
+        Self::record_dispute_outcome(&env, &engagement, true);
         Self::emit_milestone_status_changed(
             &env,
             &engagement_id,
@@ -2172,6 +2379,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
+        // Issue #578: payout releases escrow.
+        Self::add_token_locked(&env, &engagement.token, -payment);
 
         let token_client = token::Client::new(&env, &engagement.token);
         if fee_amount > 0 {
@@ -2562,6 +2771,8 @@ impl HireSettleContract {
                             milestone_index,
                             &actor,
                         );
+                        // Issue #581: enforced approve — recruiter side wins.
+                        Self::record_dispute_outcome(&env, &engagement, true);
                         true
                     } else if record.reject_weight > active_weight.saturating_sub(effective_quorum)
                     {
@@ -2571,6 +2782,8 @@ impl HireSettleContract {
                             &engagement_id,
                             milestone_index,
                         );
+                        // Issue #581: enforced reject — company wins.
+                        Self::record_dispute_outcome(&env, &engagement, false);
                         true
                     } else {
                         false

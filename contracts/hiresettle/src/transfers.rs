@@ -202,7 +202,9 @@ impl HireSettleContract {
     /// Accept a pending recruiter transfer and update the engagement's recruiter.
     ///
     /// The company finalises the transfer that was proposed by the current
-    /// recruiter. After this call, all future payouts go to the new recruiter.
+    /// recruiter. After this call, all future payouts go to the new recruiter
+    /// (or the new recruiter's own payout destination, issue #548 — the old
+    /// recruiter's destination is not carried over).
     ///
     /// # Caller
     /// `company` — must match `engagement.company` and sign the transaction.

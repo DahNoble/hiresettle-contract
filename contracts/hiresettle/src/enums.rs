@@ -211,6 +211,10 @@ pub enum ConfigKey {
     /// `apply_scheduled_fee` can apply it (issue #541). Absent or `0` ⇒
     /// `set_platform_fee` applies immediately.
     FeeChangeDelay,
+    /// Share of each collected platform fee, in basis points, paid to the
+    /// engagement's recognised referrer instead of the treasury (issue #543).
+    /// Absent or `0` ⇒ the whole fee goes to the treasury.
+    ReferrerFeeShareBps,
 }
 /// Contract storage key space. Instance keys reset between transactions;
 /// persistent keys survive across ledgers.
@@ -480,7 +484,14 @@ pub enum DataKey2 {
     /// `escalate_dispute` skip the dispute-window wait. Cleared with the
     /// dispute's recusals.
     VoteDeadlineEnforced(String, u32),
-    /// Pending negotiated cancellation proposal for an engagement (issue #576).
-    CancellationProposal(String),
+    /// Recruiter-chosen address that receives their payouts instead of the
+    /// recruiter address itself (issue #548). Absent ⇒ pay the recruiter.
+    RecruiterPayoutAddress(Address),
+    /// Pending company-proposed partial confirmation for (engagement_id,
+    /// milestone_index) (issue #550).
+    PartialConfirmationProposal(String, u32),
+    /// Pending mutual settlement proposal for a disputed (engagement_id,
+    /// milestone_index) (issue #564).
+    DisputeSettlementProposal(String, u32),
 }
 

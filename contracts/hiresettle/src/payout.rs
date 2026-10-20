@@ -1,4 +1,7 @@
-use soroban_sdk::{contractclient, contractimpl, token, Address, Env, String, Symbol};
+use soroban_sdk::{
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    contractclient, contractimpl, token, vec, Address, Env, IntoVal, String, Symbol,
+};
 use crate::*;
 
 /// Interface a trusted swap-adapter contract must implement (issues #458, #549).
@@ -76,6 +79,57 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #548 — RECRUITER PAYOUT DESTINATION
+    // ----------------------------------------------------------
+
+    /// Recruiter (primary or co-recruiter) sets the address that receives
+    /// their payouts across all engagements — milestone payouts, streamed
+    /// claims, swapped payouts, bond refunds and `claim_payouts` withdrawals.
+    /// `None` clears it, so payouts go to the recruiter address again.
+    ///
+    /// The destination belongs to the recruiter address, not to an
+    /// engagement, so a recruiter transfer (`accept_recruiter_transfer`)
+    /// never carries the old recruiter's destination over to the new one.
+    ///
+    /// # Events
+    /// `("payout_address_set", recruiter)` with `destination`.
+    pub fn set_recruiter_payout_address(
+        env: Env,
+        recruiter: Address,
+        destination: Option<Address>,
+    ) {
+        recruiter.require_auth();
+        let key = DataKey2::RecruiterPayoutAddress(recruiter.clone());
+        match &destination {
+            Some(addr) if *addr != recruiter => {
+                env.storage().persistent().set(&key, addr);
+                env.storage().persistent().extend_ttl(&key, 100_000, 6_300_000);
+            }
+            _ => env.storage().persistent().remove(&key),
+        }
+        env.events().publish(
+            (Symbol::new(&env, "payout_address_set"), recruiter),
+            destination,
+        );
+    }
+
+    /// Return the recruiter's payout destination, if one is set.
+    pub fn get_recruiter_payout_address(env: Env, recruiter: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::RecruiterPayoutAddress(recruiter))
+    }
+
+    /// Address that actually receives a payout owed to `recruiter`: their
+    /// payout destination if set, otherwise `recruiter` itself (issue #548).
+    pub(crate) fn recruiter_payout_destination(env: &Env, recruiter: &Address) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::RecruiterPayoutAddress(recruiter.clone()))
+            .unwrap_or_else(|| recruiter.clone())
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #549 — SWAP SLIPPAGE PROTECTION
     // ----------------------------------------------------------
 
@@ -149,6 +203,9 @@ impl HireSettleContract {
     /// paid instead and `payout_swap_fallback` is emitted, so the confirmation
     /// still succeeds. An adapter that reports success below `min_out` breaks
     /// the [`SwapAdapter`] contract and the whole call panics.
+    ///
+    /// Issue #548: the token preference is looked up for `recipient`, but the
+    /// funds (swapped or not) go to `recipient`'s payout destination.
     pub(crate) fn pay_recruiter_share(
         env: &Env,
         token_client: &token::Client,
@@ -159,6 +216,7 @@ impl HireSettleContract {
             .storage()
             .persistent()
             .get(&DataKey2::RecruiterPayoutToken(recipient.clone()));
+        let destination = Self::recruiter_payout_destination(env, recipient);
         let adapter: Option<Address> = env
             .storage()
             .instance()
@@ -174,21 +232,88 @@ impl HireSettleContract {
                     &adapter,
                     &to_token,
                     recipient,
+                    &destination,
                     amount,
                 ) {
                     Ok(()) => return,
                     Err(min_out) => min_out,
                 };
-                token_client.transfer(&env.current_contract_address(), recipient, &amount);
+                token_client.transfer(&env.current_contract_address(), &destination, &amount);
                 env.events().publish(
                     (Symbol::new(env, "payout_swap_fallback"), recipient.clone()),
                     (token_client.address.clone(), to_token, amount, min_out),
                 );
             }
             _ => {
-                token_client.transfer(&env.current_contract_address(), recipient, &amount);
+                token_client.transfer(&env.current_contract_address(), &destination, &amount);
             }
         }
+    }
+
+    /// Attempt the slippage-bounded swap for one payout. Returns `Err(min_out)`
+    /// (`0` when no quote was obtained) when the payout must fall back to the
+    /// escrow token; nothing has moved in that case, because the adapter pulls
+    /// the funds inside its own `swap` frame and a failed `try_swap` rolls
+    /// that pull back.
+    ///
+    /// The slippage tolerance is `recipient`'s; the swapped tokens are
+    /// delivered to `destination`, their payout destination (issue #548).
+    fn try_swap_payout(
+        env: &Env,
+        token_client: &token::Client,
+        adapter: &Address,
+        to_token: &Address,
+        recipient: &Address,
+        destination: &Address,
+        amount: i128,
+    ) -> Result<(), i128> {
+        let from_token = token_client.address.clone();
+        let adapter_client = SwapAdapterClient::new(env, adapter);
+
+        let quote = match adapter_client.try_quote(&from_token, to_token, &amount) {
+            Ok(Ok(q)) if q > 0 => q,
+            _ => return Err(0),
+        };
+        let slippage_bps = Self::get_recruiter_payout_slippage(env.clone(), recipient.clone());
+        let keep_bps = (FULL_SPLIT_BPS - slippage_bps) as i128;
+        let min_out = quote
+            .checked_mul(keep_bps)
+            .map(|v| v / FULL_SPLIT_BPS as i128)
+            // Only reachable for quotes near i128::MAX; round down instead.
+            .unwrap_or((quote / FULL_SPLIT_BPS as i128) * keep_bps);
+
+        let this = env.current_contract_address();
+        env.authorize_as_current_contract(vec![
+            env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: from_token.clone(),
+                    fn_name: Symbol::new(env, "transfer"),
+                    args: (this.clone(), adapter.clone(), amount).into_val(env),
+                },
+                sub_invocations: vec![env],
+            }),
+        ]);
+
+        let amount_out = match adapter_client.try_swap(
+            &this,
+            &from_token,
+            to_token,
+            &amount,
+            &min_out,
+            destination,
+        ) {
+            Ok(Ok(out)) => out,
+            _ => return Err(min_out),
+        };
+        if amount_out < min_out {
+            panic!("SwapOutputBelowMinimum");
+        }
+        env.events().publish(
+            (Symbol::new(env, "payout_swapped"), recipient.clone()),
+            (from_token, to_token.clone(), amount, amount_out),
+        );
+        Ok(())
     }
 
     // ----------------------------------------------------------
@@ -202,7 +327,8 @@ impl HireSettleContract {
     /// engagement. Returns `0` without transferring when nothing is owed.
     ///
     /// Credited balances are always in the engagement's escrow token; the
-    /// payout token preference (issue #458) is not applied.
+    /// payout token preference (issue #458) is not applied. The withdrawal is
+    /// sent to the recruiter's payout destination when one is set (issue #548).
     ///
     /// # Panics
     /// - `"ContractPaused"` — the contract is paused.
@@ -221,7 +347,7 @@ impl HireSettleContract {
         env.storage().persistent().remove(&key);
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
-            &recruiter,
+            &Self::recruiter_payout_destination(&env, &recruiter),
             &amount,
         );
         env.events().publish(
@@ -286,8 +412,8 @@ impl HireSettleContract {
     }
 
     /// Send a recruiter-side amount that is not a milestone payout (e.g. a
-    /// bond refund): credited on `pull_payouts` engagements, transferred
-    /// otherwise.
+    /// bond refund): credited on `pull_payouts` engagements, transferred to
+    /// the recipient's payout destination (issue #548) otherwise.
     pub(crate) fn pay_or_credit_recruiter(
         env: &Env,
         engagement: &Engagement,
@@ -304,7 +430,11 @@ impl HireSettleContract {
                 amount,
             );
         } else {
-            token_client.transfer(&env.current_contract_address(), recipient, &amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &Self::recruiter_payout_destination(env, recipient),
+                &amount,
+            );
         }
     }
 }

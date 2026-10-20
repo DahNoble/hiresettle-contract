@@ -7,6 +7,17 @@ use soroban_sdk::{
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
 const MAX_ARBITER_FEE_BPS: u32 = 200;
 const FULL_SPLIT_BPS: u32 = 10_000;
+/// Per-function pause ids for `set_function_paused` (issue #589). They share
+/// the same `u32` id scheme as the sensitive setters but live in a disjoint
+/// range so the two features never collide.
+const FN_CREATE_ENGAGEMENT: u32 = 10;
+const FN_CONFIRM_MILESTONE: u32 = 11;
+const FN_BATCH_CONFIRM_MILESTONES: u32 = 12;
+const FN_RAISE_DISPUTE: u32 = 13;
+const FN_SUBMIT_PROOF: u32 = 14;
+const FN_CANCEL_ENGAGEMENT: u32 = 15;
+const FN_TOP_UP_ESCROW: u32 = 16;
+const FN_UNLOCK_MILESTONE: u32 = 17;
 
 // ============================================================
 // DATA TYPES
@@ -218,6 +229,9 @@ pub struct Engagement {
     pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
+    /// Optional absolute deadline ledger copied from
+    /// `EngagementConfig::end_ledger` (issue #571). `None` means no deadline.
+    pub end_ledger: Option<u32>,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -269,6 +283,17 @@ pub struct ArbiterVoteRecord {
     pub reject_votes: u32,
     /// Addresses that have already cast a vote; prevents double-voting.
     pub voted: Vec<Address>,
+}
+
+/// Role of a company team member (issue #575): which company-gated actions
+/// the member may perform on any engagement of that company.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum CompanyMemberRole {
+    /// May call `confirm_milestone` / `batch_confirm_milestones`.
+    Confirmer,
+    /// May call `raise_dispute`.
+    Disputer,
 }
 
 /// Passed to `create_engagement` to configure the arbitration panel for an engagement.
@@ -395,6 +420,11 @@ pub struct EngagementConfig {
     pub referrer: Option<Address>,
     /// Optional list of short string tags for off-chain categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
+    /// Optional absolute deadline ledger (issue #571). After this ledger,
+    /// anyone may call `close_engagement_at_end`. Must be after the last
+    /// retention milestone's earliest unlock when set. `None` keeps today's
+    /// behaviour.
+    pub end_ledger: Option<u32>,
 }
 
 /// Returned by `get_contract_health` for quick off-chain diagnostics (issue #256).
@@ -576,6 +606,19 @@ pub enum ConfigKey {
     ReferralDiscountBps,
     /// Admin-configurable TTL for pending config change proposals (default 17_280 — ~1 day).
     ConfigChangeTTL,
+    /// Quarantine escape delay in ledgers (issue #590). `0` (the default)
+    /// disables `emergency_exit`.
+    PauseEscapeDelay,
+    /// Ledger at which an engagement was last (re-)paused via
+    /// `pause_engagement` (issue #590). Cleared by `unpause_engagement`
+    /// so unpausing resets the escape timer.
+    QuarantineStartedAt(String),
+    /// Role of a company team member, scoped to `(company, member)`
+    /// (issue #575). Absent means the address is not a team member.
+    CompanyMember(Address, Address),
+    /// Per-function pause flag for `fn_id` (issue #589). Present and `true`
+    /// means the entry point is paused; absent means it runs normally.
+    FunctionPaused(u32),
 }
 
 /// Contract storage key space. Instance keys reset between transactions;
@@ -1025,6 +1068,39 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #589 — PER-FUNCTION PAUSE
+    // ----------------------------------------------------------
+
+    /// Pause or unpause a single state-changing entry point identified by
+    /// `fn_id` (same `u32` id scheme as the sensitive setters, e.g.
+    /// `FN_CREATE_ENGAGEMENT`), without halting the rest of the contract.
+    /// Each guarded entry point checks its id in addition to the global and
+    /// per-engagement pauses; read-only queries are never pausable. The
+    /// global pause still overrides everything.
+    ///
+    /// # Events
+    /// `("function_pause_set",)` with `(fn_id, paused)`.
+    pub fn set_function_paused(env: Env, admin: Address, fn_id: u32, paused: bool) {
+        Self::assert_admin(&env, &admin);
+        let key = DataKey::Config(ConfigKey::FunctionPaused(fn_id));
+        if paused {
+            env.storage().persistent().set(&key, &true);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 100_000, 6_300_000);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        env.events()
+            .publish((Symbol::new(&env, "function_pause_set"),), (fn_id, paused));
+    }
+
+    /// Return `true` if the entry point `fn_id` is currently paused.
+    pub fn is_function_paused(env: Env, fn_id: u32) -> bool {
+        Self::is_function_paused_internal(&env, fn_id)
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #239 — PER-ENGAGEMENT PAUSE (QUARANTINE)
     // ----------------------------------------------------------
 
@@ -1079,6 +1155,16 @@ impl HireSettleContract {
             6_300_000,
         );
 
+        // Issue #590: (re-)pausing starts the escape-hatch quarantine timer.
+        let started_at_key =
+            DataKey::Config(ConfigKey::QuarantineStartedAt(engagement_id.clone()));
+        env.storage()
+            .persistent()
+            .set(&started_at_key, &env.ledger().sequence());
+        env.storage()
+            .persistent()
+            .extend_ttl(&started_at_key, 100_000, 6_300_000);
+
         env.events().publish(
             (
                 Symbol::new(&env, "engagement_paused"),
@@ -1110,12 +1196,142 @@ impl HireSettleContract {
             .persistent()
             .remove(&DataKey::EngagementPaused(engagement_id.clone()));
 
+        // Issue #590: unpausing resets the escape-hatch timer.
+        env.storage().persistent().remove(&DataKey::Config(
+            ConfigKey::QuarantineStartedAt(engagement_id.clone()),
+        ));
+
         env.events().publish(
             (
                 Symbol::new(&env, "engagement_unpaused"),
                 engagement_id.clone(),
             ),
             admin,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #590 — PAUSED-ENGAGEMENT ESCAPE HATCH
+    // ----------------------------------------------------------
+
+    /// Admin sets the quarantine escape delay in ledgers (e.g. ~180 days of
+    /// ledgers). After an engagement has been continuously paused longer than
+    /// this, either party may call `emergency_exit`. `0` (the default)
+    /// disables the escape hatch.
+    ///
+    /// # Events
+    /// `("pause_escape_ledgers_set",)` with `ledgers`.
+    pub fn set_pause_escape_ledgers(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Config(ConfigKey::PauseEscapeDelay), &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "pause_escape_ledgers_set"),), ledgers);
+    }
+
+    /// Return the quarantine escape delay in ledgers (`0` when disabled).
+    pub fn get_pause_escape_ledgers(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::PauseEscapeDelay))
+            .unwrap_or(0u32)
+    }
+
+    /// Refund path for an engagement frozen by `pause_engagement` when the
+    /// admin key is lost. Either the company or the recruiter (or their
+    /// co-signers) may call once the engagement has been continuously paused
+    /// longer than `get_pause_escape_ledgers`. Refunds all unreleased escrow
+    /// to the company, clears the quarantine markers and sets status
+    /// `Cancelled`.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the global pause is active.
+    /// - `"engagement is not active"` — the engagement is not `Active`.
+    /// - `"unauthorized"` — caller is neither party (nor a co-signer).
+    /// - `"EngagementNotPaused"` — the engagement is not quarantined.
+    /// - `"EscapeDisabled"` — no escape delay is configured.
+    /// - `"EscapeNotReady"` — the quarantine has not lasted long enough.
+    ///
+    /// # Events
+    /// `("emergency_exit", engagement_id)` with the caller, plus the
+    /// `Active → Cancelled` status-change event.
+    pub fn emergency_exit(env: Env, caller: Address, engagement_id: String) {
+        // Not available while the global pause is active.
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        if !Self::is_authorized_company(&env, &caller, &engagement.company)
+            && !Self::is_authorized_recruiter(&env, &caller, &engagement.recruiter)
+        {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        if !Self::is_engagement_paused_internal(&env, &engagement_id) {
+            panic!("EngagementNotPaused");
+        }
+        let escape: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::PauseEscapeDelay))
+            .unwrap_or(0u32);
+        if escape == 0 {
+            panic!("EscapeDisabled");
+        }
+        let paused_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::QuarantineStartedAt(
+                engagement_id.clone(),
+            )))
+            .unwrap_or_else(|| panic!("EngagementNotPaused"));
+        if env.ledger().sequence() < paused_at.saturating_add(escape) {
+            panic!("EscapeNotReady");
+        }
+
+        let refund = engagement.total_amount - engagement.released_amount;
+        if refund > 0 {
+            let token_client = token::Client::new(&env, &engagement.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &engagement.company,
+                &refund,
+            );
+        }
+
+        let old_engagement_status = engagement.status.clone();
+        engagement.status = EngagementStatus::Cancelled;
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
+
+        Self::decrement_company_active_count(&env, &engagement.company);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EngagementPaused(engagement_id.clone()));
+        env.storage().persistent().remove(&DataKey::Config(
+            ConfigKey::QuarantineStartedAt(engagement_id.clone()),
+        ));
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_exit"), engagement_id.clone()),
+            caller,
         );
     }
 
@@ -1265,6 +1481,7 @@ impl HireSettleContract {
         config: EngagementConfig,
     ) -> String {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_CREATE_ENGAGEMENT);
         company.require_auth();
 
         // Validate engagement_id format: non-empty, ≤ 64 chars, [A-Za-z0-9-] only.
@@ -1482,6 +1699,19 @@ impl HireSettleContract {
             resolved_milestones.push_back(m);
         }
 
+        // Issue #571: an absolute deadline must lie in the future and after
+        // the last retention milestone's earliest unlock.
+        if let Some(end) = config.end_ledger {
+            if end <= current_ledger {
+                panic!("InvalidEndLedger");
+            }
+            for i in 0..resolved_milestones.len() {
+                if end <= resolved_milestones.get(i).unwrap().valid_after_ledger {
+                    panic!("InvalidEndLedger");
+                }
+            }
+        }
+
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&company, &env.current_contract_address(), &total_amount);
         Self::on_escrow_lifecycle_checkpoint(
@@ -1514,6 +1744,7 @@ impl HireSettleContract {
             contract_pdf_hash: config.contract_pdf_hash,
             referrer: config.referrer,
             tags: config.tags.clone(),
+            end_ledger: config.end_ledger,
         };
 
         env.storage()
@@ -1659,6 +1890,7 @@ impl HireSettleContract {
     ///   before `valid_after_ledger`.
     pub fn unlock_milestone(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_UNLOCK_MILESTONE);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
@@ -1935,6 +2167,7 @@ impl HireSettleContract {
         proof_hash: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_SUBMIT_PROOF);
         Self::assert_engagement_not_paused(&env, &engagement_id);
 
         // Issue #20: Proof hash format validation (before require_auth for fail-fast)
@@ -2056,6 +2289,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_CONFIRM_MILESTONE);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
@@ -2065,7 +2299,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_company_confirmer(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2178,6 +2412,17 @@ impl HireSettleContract {
             ),
             (milestone_index, payment),
         );
+        // Issue #575: identify the team member when the confirmer is not the
+        // company itself.
+        if Self::company_member_role(&env, &engagement.company, &company).is_some() {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "milestone_confirmed_by_member"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, company.clone()),
+            );
+        }
 
         if all_done {
             env.events().publish(
@@ -2236,6 +2481,7 @@ impl HireSettleContract {
         reason: String,
     ) {
         Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_function_not_paused(&env, FN_RAISE_DISPUTE);
         company.require_auth();
 
         if reason.len() > 128 {
@@ -2248,7 +2494,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_company_disputer(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2303,6 +2549,17 @@ impl HireSettleContract {
             (Symbol::new(&env, "dispute_raised"), engagement_id.clone()),
             (milestone_index, reason),
         );
+        // Issue #575: identify the team member when the disputer is not the
+        // company itself.
+        if Self::company_member_role(&env, &engagement.company, &company).is_some() {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "dispute_raised_by_member"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, company.clone()),
+            );
+        }
     }
 
     // ----------------------------------------------------------
@@ -3465,6 +3722,106 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #575 — COMPANY TEAM MEMBERS
+    // ----------------------------------------------------------
+
+    /// Register a team member scoped to `company` with a role that grants a
+    /// subset of company-gated actions on every engagement of that company:
+    /// `Confirmer` may confirm milestones, `Disputer` may raise disputes.
+    /// Cancellation, top-ups, transfers and amendments stay company-only.
+    /// Only the company address itself may manage its members.
+    ///
+    /// # Events
+    /// `("company_member_added", company)` with `(member, role)`.
+    pub fn add_company_member(
+        env: Env,
+        company: Address,
+        member: Address,
+        role: CompanyMemberRole,
+    ) {
+        company.require_auth();
+        let key = DataKey::Config(ConfigKey::CompanyMember(company.clone(), member.clone()));
+        env.storage().persistent().set(&key, &role);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events().publish(
+            (Symbol::new(&env, "company_member_added"), company),
+            (member, role),
+        );
+    }
+
+    /// Remove a team member effective immediately: the address loses its
+    /// delegated rights on every engagement of the company at once. Removing
+    /// an address that is not a member is a no-op that still emits the event.
+    ///
+    /// # Events
+    /// `("company_member_removed", company)` with `member`.
+    pub fn remove_company_member(env: Env, company: Address, member: Address) {
+        company.require_auth();
+        env.storage().persistent().remove(&DataKey::Config(
+            ConfigKey::CompanyMember(company.clone(), member.clone()),
+        ));
+        env.events().publish(
+            (Symbol::new(&env, "company_member_removed"), company),
+            member,
+        );
+    }
+
+    /// Return the team role of `member` under `company`, or `None` if the
+    /// address is not a member.
+    pub fn get_company_member_role(
+        env: Env,
+        company: Address,
+        member: Address,
+    ) -> Option<CompanyMemberRole> {
+        Self::company_member_role(&env, &company, &member)
+    }
+
+    /// Internal helper: the team role of `member` under `company`, if any.
+    fn company_member_role(
+        env: &Env,
+        company: &Address,
+        member: &Address,
+    ) -> Option<CompanyMemberRole> {
+        env.storage().persistent().get(&DataKey::Config(
+            ConfigKey::CompanyMember(company.clone(), member.clone()),
+        ))
+    }
+
+    /// Whether `caller` may confirm milestones: the company itself, its
+    /// co-signer (full rights), or a team member with the `Confirmer` role.
+    fn is_company_confirmer(
+        env: &Env,
+        caller: &Address,
+        engagement_company: &Address,
+    ) -> bool {
+        if Self::is_authorized_company(env, caller, engagement_company) {
+            return true;
+        }
+        matches!(
+            Self::company_member_role(env, engagement_company, caller),
+            Some(CompanyMemberRole::Confirmer)
+        )
+    }
+
+    /// Whether `caller` may dispute milestones: the company itself, its
+    /// co-signer (full rights), or a team member with the `Disputer` role.
+    fn is_company_disputer(
+        env: &Env,
+        caller: &Address,
+        engagement_company: &Address,
+    ) -> bool {
+        if Self::is_authorized_company(env, caller, engagement_company) {
+            return true;
+        }
+        matches!(
+            Self::company_member_role(env, engagement_company, caller),
+            Some(CompanyMemberRole::Disputer)
+        )
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #258 — RESERVED ESCROW CALLBACK CHECKPOINT
     // ----------------------------------------------------------
 
@@ -3747,6 +4104,7 @@ impl HireSettleContract {
         engagement_id: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_CANCEL_ENGAGEMENT);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
         recruiter.require_auth();
@@ -3825,12 +4183,155 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #571 — HARD ENGAGEMENT END DATE
+    // ----------------------------------------------------------
+
+    /// Close an engagement past its absolute deadline
+    /// (`EngagementConfig::end_ledger`). Permissionless: anyone may call once
+    /// `current_ledger >= end_ledger`. `ProofSubmitted` milestones are
+    /// auto-confirmed with the same economics as `confirm_milestone`;
+    /// confirmed amounts stay paid and everything else unreleased is refunded
+    /// to the company, so `released + refunded == total_amount`.
+    ///
+    /// Idempotent: calling on a terminal engagement is a no-op. Engagements
+    /// without an `end_ledger` keep today's behaviour (`"NoEndLedger"`).
+    ///
+    /// # Panics
+    /// - `"NoEndLedger"` — the engagement has no deadline configured.
+    /// - `"EndLedgerNotReached"` — the current ledger is before `end_ledger`.
+    /// - `"engagement is not active"` — the engagement is not `Active`.
+    /// - `"DisputePending"` — a milestone is `Disputed`; resolve it first.
+    ///
+    /// # Events
+    /// Per auto-confirmed milestone `("milestone_confirmed", engagement_id)`
+    /// with `(milestone_index, payment)`, plus
+    /// `("engagement_closed_at_end", engagement_id)` with
+    /// `(released_amount, refund)`.
+    pub fn close_engagement_at_end(env: Env, engagement_id: String) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        // Idempotent: an already-closed engagement reports success silently.
+        if Self::is_terminal_status(&engagement.status) {
+            return;
+        }
+
+        let end = engagement
+            .end_ledger
+            .unwrap_or_else(|| panic!("NoEndLedger"));
+        if env.ledger().sequence() < end {
+            panic!("EndLedgerNotReached");
+        }
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        for i in 0..engagement.milestones.len() {
+            if engagement.milestones.get(i).unwrap().status == MilestoneStatus::Disputed {
+                panic!("DisputePending");
+            }
+        }
+
+        for i in 0..engagement.milestones.len() {
+            let m = engagement.milestones.get(i).unwrap();
+            if m.status != MilestoneStatus::ProofSubmitted {
+                continue;
+            }
+            let full_share =
+                (engagement.total_amount * m.payment_percent as i128) / 100;
+            let payment = full_share - m.replacement_paid_out;
+            if payment > 0 {
+                let platform_fee = Self::get_platform_fee_internal(&env);
+                let effective_bps = Self::apply_referral_discount(
+                    &env,
+                    platform_fee.bps,
+                    &engagement.referrer,
+                );
+                let fee_amount = (payment * effective_bps as i128) / 10_000;
+                let net_payment = payment - fee_amount;
+                engagement.released_amount += payment;
+
+                let token_client = token::Client::new(&env, &engagement.token);
+                if fee_amount > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &platform_fee.treasury,
+                        &fee_amount,
+                    );
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "platform_fee_collected"),
+                            engagement_id.clone(),
+                        ),
+                        (i, fee_amount, platform_fee.treasury.clone()),
+                    );
+                }
+                Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+            }
+            let mut updated = m.clone();
+            updated.status = MilestoneStatus::Confirmed;
+            engagement.milestones.set(i, updated);
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                i,
+                MilestoneStatus::ProofSubmitted,
+                MilestoneStatus::Confirmed,
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "milestone_confirmed"),
+                    engagement_id.clone(),
+                ),
+                (i, payment),
+            );
+        }
+
+        let refund = engagement.total_amount - engagement.released_amount;
+        if refund > 0 {
+            let token_client = token::Client::new(&env, &engagement.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &engagement.company,
+                &refund,
+            );
+        }
+
+        let old_engagement_status = engagement.status.clone();
+        engagement.status = EngagementStatus::Cancelled;
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
+
+        Self::decrement_company_active_count(&env, &engagement.company);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_closed_at_end"),
+                engagement_id.clone(),
+            ),
+            (engagement.released_amount, refund),
+        );
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #33 — ESCROW TOP-UP
     // ----------------------------------------------------------
 
     /// Company tops up the escrow balance for an active engagement.
     pub fn top_up_escrow(env: Env, company: Address, engagement_id: String, amount: i128) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_TOP_UP_ESCROW);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
@@ -6091,6 +6592,7 @@ impl HireSettleContract {
         milestone_indices: Vec<u32>,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_BATCH_CONFIRM_MILESTONES);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
@@ -6104,7 +6606,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_company_confirmer(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -6192,6 +6694,17 @@ impl HireSettleContract {
                 ),
                 (idx, payment),
             );
+            // Issue #575: identify the team member when the confirmer is not
+            // the company itself.
+            if Self::company_member_role(&env, &engagement.company, &company).is_some() {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "milestone_confirmed_by_member"),
+                        engagement_id.clone(),
+                    ),
+                    (idx, company.clone()),
+                );
+            }
         }
 
         let all_done = (0..engagement.milestones.len()).all(|i| {
@@ -6982,6 +7495,25 @@ impl HireSettleContract {
     fn assert_not_paused(env: &Env) {
         if Self::is_paused_internal(env) {
             panic!("ContractPaused");
+        }
+    }
+
+    /// Per-function pause flag (issue #589): `true` once the admin pauses
+    /// `fn_id` via `set_function_paused`, `false` by default. Read-only
+    /// queries never consult this flag.
+    fn is_function_paused_internal(env: &Env, fn_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::FunctionPaused(fn_id)))
+            .unwrap_or(false)
+    }
+
+    /// Guard for state-changing entry points (issue #589). Layered under the
+    /// global pause: callers check `assert_not_paused` first, so the global
+    /// pause still overrides everything.
+    fn assert_function_not_paused(env: &Env, fn_id: u32) {
+        if Self::is_function_paused_internal(env, fn_id) {
+            panic!("FunctionPaused");
         }
     }
 
