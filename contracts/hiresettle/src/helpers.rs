@@ -603,6 +603,9 @@ impl HireSettleContract {
     /// On a `pull_payouts` engagement (issue #547) each share is credited to
     /// the payee's claimable balance in the escrow token instead, so nothing
     /// is transferred and no payout token preference is applied.
+    ///
+    /// Transferred shares go to each payee's payout destination when one is
+    /// set (issue #548); credited shares are sent there by `claim_payouts`.
     pub(crate) fn distribute_recruiter_payout(
         env: &Env,
         engagement: &Engagement,
@@ -623,7 +626,11 @@ impl HireSettleContract {
             } else if apply_payout_preference {
                 Self::pay_recruiter_share(env, token_client, recipient, amount);
             } else {
-                token_client.transfer(&env.current_contract_address(), recipient, &amount);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &Self::recruiter_payout_destination(env, recipient),
+                    &amount,
+                );
             }
         };
         match &engagement.co_recruiter {

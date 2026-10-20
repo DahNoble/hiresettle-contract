@@ -604,3 +604,42 @@ pub struct NextAction {
     /// `ledgers_until_unlock` of a locked milestone).
     pub available_at_ledger: u32,
 }
+
+/// Pending company-proposed partial release of a `ProofSubmitted` milestone
+/// (issue #550), stored under `DataKey2::PartialConfirmationProposal`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartialConfirmationProposal {
+    /// Company (or company co-signer) that made the proposal.
+    pub proposer: Address,
+    /// Share of the milestone amount, in basis points, released to the
+    /// recruiter on acceptance; the remainder is refunded to the company.
+    pub release_bps: u32,
+    /// `proof_submitted_at` of the proof the proposal was made against. A
+    /// proposal only applies to that submission.
+    pub proof_submitted_at: u32,
+    /// Ledger at which the proposal was made.
+    pub proposed_at_ledger: u32,
+    /// Last ledger at which the proposal can still be accepted.
+    pub expires_at_ledger: u32,
+}
+
+/// Pending mutual settlement of a disputed milestone (issue #564), stored
+/// under `DataKey2::DisputeSettlementProposal`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeSettlementProposal {
+    /// Address that proposed the settlement.
+    pub proposer: Address,
+    /// `true` if the company side proposed; `false` if the recruiter side did.
+    /// The other side must accept.
+    pub proposed_by_company: bool,
+    /// Share of the milestone amount, in basis points, paid to the recruiter;
+    /// the remainder is refunded to the company.
+    pub recruiter_bps: u32,
+    /// Dispute cycle (`get_dispute_cycles`) the proposal was made in. A
+    /// proposal only settles that dispute, never a later one.
+    pub dispute_cycle: u32,
+    /// Ledger at which the proposal was made.
+    pub proposed_at_ledger: u32,
+}
