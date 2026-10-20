@@ -202,6 +202,21 @@ impl HireSettleContract {
         Self::get_engagement_internal(&env, &engagement_id).released_amount
     }
 
+    /// Return a party's cross-engagement dispute counters (issue #581):
+    /// disputes raised/won/lost plus escalations. All zeros for an address
+    /// with no recorded dispute activity. Read-only, permissionless.
+    pub fn get_party_dispute_stats(env: Env, party: Address) -> DisputeStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::PartyDisputeStats(party))
+            .unwrap_or(DisputeStats {
+                disputes_raised: 0,
+                disputes_won: 0,
+                disputes_lost: 0,
+                escalations: 0,
+            })
+    }
+
     /// Return a lightweight summary of an engagement, suitable for list/dashboard views.
     ///
     /// Prefer this over `get_engagement` when you only need top-level fields and not
