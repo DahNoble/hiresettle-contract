@@ -584,6 +584,13 @@ pub enum ConfigKey {
     ReferralDiscountBps,
     /// Admin-configurable TTL for pending config change proposals (default 17_280 — ~1 day).
     ConfigChangeTTL,
+    /// Quarantine escape delay in ledgers (issue #590). `0` (the default)
+    /// disables `emergency_exit`.
+    PauseEscapeDelay,
+    /// Ledger at which an engagement was last (re-)paused via
+    /// `pause_engagement` (issue #590). Cleared by `unpause_engagement`
+    /// so unpausing resets the escape timer.
+    QuarantineStartedAt(String),
 }
 
 /// Contract storage key space. Instance keys reset between transactions;
@@ -1087,6 +1094,16 @@ impl HireSettleContract {
             6_300_000,
         );
 
+        // Issue #590: (re-)pausing starts the escape-hatch quarantine timer.
+        let started_at_key =
+            DataKey::Config(ConfigKey::QuarantineStartedAt(engagement_id.clone()));
+        env.storage()
+            .persistent()
+            .set(&started_at_key, &env.ledger().sequence());
+        env.storage()
+            .persistent()
+            .extend_ttl(&started_at_key, 100_000, 6_300_000);
+
         env.events().publish(
             (
                 Symbol::new(&env, "engagement_paused"),
@@ -1118,12 +1135,142 @@ impl HireSettleContract {
             .persistent()
             .remove(&DataKey::EngagementPaused(engagement_id.clone()));
 
+        // Issue #590: unpausing resets the escape-hatch timer.
+        env.storage().persistent().remove(&DataKey::Config(
+            ConfigKey::QuarantineStartedAt(engagement_id.clone()),
+        ));
+
         env.events().publish(
             (
                 Symbol::new(&env, "engagement_unpaused"),
                 engagement_id.clone(),
             ),
             admin,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #590 — PAUSED-ENGAGEMENT ESCAPE HATCH
+    // ----------------------------------------------------------
+
+    /// Admin sets the quarantine escape delay in ledgers (e.g. ~180 days of
+    /// ledgers). After an engagement has been continuously paused longer than
+    /// this, either party may call `emergency_exit`. `0` (the default)
+    /// disables the escape hatch.
+    ///
+    /// # Events
+    /// `("pause_escape_ledgers_set",)` with `ledgers`.
+    pub fn set_pause_escape_ledgers(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Config(ConfigKey::PauseEscapeDelay), &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "pause_escape_ledgers_set"),), ledgers);
+    }
+
+    /// Return the quarantine escape delay in ledgers (`0` when disabled).
+    pub fn get_pause_escape_ledgers(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::PauseEscapeDelay))
+            .unwrap_or(0u32)
+    }
+
+    /// Refund path for an engagement frozen by `pause_engagement` when the
+    /// admin key is lost. Either the company or the recruiter (or their
+    /// co-signers) may call once the engagement has been continuously paused
+    /// longer than `get_pause_escape_ledgers`. Refunds all unreleased escrow
+    /// to the company, clears the quarantine markers and sets status
+    /// `Cancelled`.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the global pause is active.
+    /// - `"engagement is not active"` — the engagement is not `Active`.
+    /// - `"unauthorized"` — caller is neither party (nor a co-signer).
+    /// - `"EngagementNotPaused"` — the engagement is not quarantined.
+    /// - `"EscapeDisabled"` — no escape delay is configured.
+    /// - `"EscapeNotReady"` — the quarantine has not lasted long enough.
+    ///
+    /// # Events
+    /// `("emergency_exit", engagement_id)` with the caller, plus the
+    /// `Active → Cancelled` status-change event.
+    pub fn emergency_exit(env: Env, caller: Address, engagement_id: String) {
+        // Not available while the global pause is active.
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        if !Self::is_authorized_company(&env, &caller, &engagement.company)
+            && !Self::is_authorized_recruiter(&env, &caller, &engagement.recruiter)
+        {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        if !Self::is_engagement_paused_internal(&env, &engagement_id) {
+            panic!("EngagementNotPaused");
+        }
+        let escape: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::PauseEscapeDelay))
+            .unwrap_or(0u32);
+        if escape == 0 {
+            panic!("EscapeDisabled");
+        }
+        let paused_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::QuarantineStartedAt(
+                engagement_id.clone(),
+            )))
+            .unwrap_or_else(|| panic!("EngagementNotPaused"));
+        if env.ledger().sequence() < paused_at.saturating_add(escape) {
+            panic!("EscapeNotReady");
+        }
+
+        let refund = engagement.total_amount - engagement.released_amount;
+        if refund > 0 {
+            let token_client = token::Client::new(&env, &engagement.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &engagement.company,
+                &refund,
+            );
+        }
+
+        let old_engagement_status = engagement.status.clone();
+        engagement.status = EngagementStatus::Cancelled;
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
+
+        Self::decrement_company_active_count(&env, &engagement.company);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EngagementPaused(engagement_id.clone()));
+        env.storage().persistent().remove(&DataKey::Config(
+            ConfigKey::QuarantineStartedAt(engagement_id.clone()),
+        ));
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_exit"), engagement_id.clone()),
+            caller,
         );
     }
 
