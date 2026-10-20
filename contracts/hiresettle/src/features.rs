@@ -598,6 +598,10 @@ impl HireSettleContract {
     /// When weighted fee treasuries are configured (issue #540), the amount
     /// owed to the treasury is split across them instead; see
     /// [`Self::route_fee_to_treasuries`].
+    ///
+    /// When a referrer fee share is configured (issue #543), that share of the
+    /// amount owed to the treasury goes to the engagement's referrer first;
+    /// see [`Self::pay_referrer_fee_share`].
     pub(crate) fn collect_platform_fee(
         env: &Env,
         engagement: &Engagement,
@@ -629,6 +633,11 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .extend_ttl(&rebate_key, 100_000, 6_300_000);
+
+        // Issue #543: the referrer's cut comes out of what would otherwise
+        // reach the treasury, so treasury + referrer always sum to it.
+        let to_treasury = to_treasury
+            - Self::pay_referrer_fee_share(env, engagement, engagement_id, to_treasury);
 
         let treasuries: Vec<(Address, u32)> = env
             .storage()
@@ -663,6 +672,50 @@ impl HireSettleContract {
             ),
             (milestone_index, fee_amount, platform_fee.treasury),
         );
+    }
+
+    /// Pay the admin-configured referrer share (issue #543) of `fee` to the
+    /// engagement's referrer and return the amount paid. Pays nothing — and
+    /// returns `0` — when the share is `0`, the engagement has no referrer,
+    /// or the referrer is no longer on the recognised referral list.
+    ///
+    /// Emits `("referrer_paid", engagement_id)` with `(referrer, amount)`
+    /// when `amount > 0`.
+    fn pay_referrer_fee_share(
+        env: &Env,
+        engagement: &Engagement,
+        engagement_id: &String,
+        fee: i128,
+    ) -> i128 {
+        if fee <= 0 {
+            return 0;
+        }
+        let referrer = match &engagement.referrer {
+            Some(referrer) => referrer,
+            None => return 0,
+        };
+        let share_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::ReferrerFeeShareBps))
+            .unwrap_or(0u32);
+        if share_bps == 0 || !Self::is_recognised_referrer(env, referrer) {
+            return 0;
+        }
+        let amount = (fee * share_bps as i128) / (FULL_SPLIT_BPS as i128);
+        if amount <= 0 {
+            return 0;
+        }
+        token::Client::new(env, &engagement.token).transfer(
+            &env.current_contract_address(),
+            referrer,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(env, "referrer_paid"), engagement_id.clone()),
+            (referrer.clone(), amount),
+        );
+        amount
     }
 
     /// Split `amount` across weighted fee treasuries (issue #540). Every

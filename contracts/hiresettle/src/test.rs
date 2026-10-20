@@ -194,6 +194,7 @@ fn default_config() -> EngagementConfig {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     }
 }
 
@@ -1417,6 +1418,7 @@ fn test_metadata_hash_present() {
             co_recruiter_bond_amount: None,
             pull_payouts: false,
             require_recruiter_acceptance: false,
+            end_ledger: None,
         },
     );
 
@@ -1479,6 +1481,7 @@ fn test_metadata_hash_empty_string_rejected() {
             co_recruiter_bond_amount: None,
             pull_payouts: false,
             require_recruiter_acceptance: false,
+            end_ledger: None,
         },
     );
 }
@@ -1510,6 +1513,7 @@ fn test_co_recruiter_60_40_split() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -1606,6 +1610,7 @@ fn test_split_bps_over_10000_rejected() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -1650,6 +1655,7 @@ fn test_co_recruiter_gets_remainder() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -1709,6 +1715,7 @@ fn test_co_recruiter_summary_fields() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -1757,6 +1764,7 @@ fn test_split_bps_10000_accepted() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -7714,6 +7722,7 @@ fn test_co_recruiter_split_with_platform_fee() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -8131,6 +8140,7 @@ fn test_co_recruiter_split_with_odd_percentage_remainder() {
         co_recruiter_bond_amount: None,
         pull_payouts: false,
         require_recruiter_acceptance: false,
+        end_ledger: None,
     };
 
     client.create_engagement(
@@ -9546,6 +9556,7 @@ fn test_split_amendment_applies_to_future_not_past() {
             co_recruiter_bond_amount: None,
             pull_payouts: false,
             require_recruiter_acceptance: false,
+            end_ledger: None,
         },
     );
 
@@ -9602,6 +9613,7 @@ fn test_split_amendment_proposer_cannot_accept() {
             co_recruiter_bond_amount: None,
             pull_payouts: false,
             require_recruiter_acceptance: false,
+            end_ledger: None,
         },
     );
     client.propose_split_amendment(&recruiter, &eng_id, &5_000);
@@ -9629,6 +9641,7 @@ fn test_split_amendment_expires() {
             co_recruiter_bond_amount: None,
             pull_payouts: false,
             require_recruiter_acceptance: false,
+            end_ledger: None,
         },
     );
     client.set_amendment_ttl(&company, &100);
@@ -13861,4 +13874,295 @@ fn test_single_super_arbiter_still_works() {
 
     let m0 = client.get_milestone(&eng_id, &0);
     assert_eq!(m0.status, MilestoneStatus::Resolved);
+}
+
+// ============================================================
+// ISSUE #543 — REFERRER REVENUE SHARE
+// ============================================================
+
+/// 500 bps platform fee, a recognised referrer, and a single-milestone 1B
+/// engagement referred by it. Returns `(treasury, referrer)`.
+fn setup_referred_engagement(
+    env: &Env,
+    client: &HireSettleContractClient,
+    token_id: &Address,
+    company: &Address,
+    recruiter: &Address,
+    arbiter: &Address,
+    id: &str,
+) -> (Address, Address) {
+    let treasury = Address::generate(env);
+    client.set_platform_fee(company, &500, &treasury);
+    let referrer = Address::generate(env);
+    client.add_referrer(company, &referrer);
+    let mut cfg = default_config();
+    cfg.referrer = Some(referrer.clone());
+    create_single_milestone_engagement(env, client, token_id, company, recruiter, arbiter, id, cfg);
+    (treasury, referrer)
+}
+
+#[test]
+fn test_referrer_fee_share_zero_is_noop() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (treasury, referrer) = setup_referred_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REF-0",
+    );
+
+    assert_eq!(client.get_referrer_fee_share_bps(), 0);
+    submit_and_confirm_placement(&env, &client, &company, &recruiter, "ENG-REF-0");
+
+    assert_eq!(token_client.balance(&treasury), 50_000_000);
+    assert_eq!(token_client.balance(&referrer), 0);
+    assert!(!has_event(&env, "referrer_paid"));
+}
+
+#[test]
+fn test_referrer_fee_share_splits_collected_fee() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (treasury, referrer) = setup_referred_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REF-SPLIT",
+    );
+
+    client.set_referrer_fee_share_bps(&company, &2_000);
+    submit_and_confirm_placement(&env, &client, &company, &recruiter, "ENG-REF-SPLIT");
+
+    let to_referrer = token_client.balance(&referrer);
+    let to_treasury = token_client.balance(&treasury);
+    assert_eq!(to_referrer, 10_000_000);
+    assert_eq!(to_treasury, 40_000_000);
+    assert_eq!(to_referrer + to_treasury, 50_000_000);
+    assert_eq!(token_client.balance(&recruiter), 950_000_000);
+    assert!(has_event(&env, "referrer_paid"));
+}
+
+#[test]
+fn test_removed_referrer_receives_no_fee_share() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let (treasury, referrer) = setup_referred_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REF-RM",
+    );
+
+    client.set_referrer_fee_share_bps(&company, &2_000);
+    client.remove_referrer(&company, &referrer);
+    submit_and_confirm_placement(&env, &client, &company, &recruiter, "ENG-REF-RM");
+
+    assert_eq!(token_client.balance(&referrer), 0);
+    assert_eq!(token_client.balance(&treasury), 50_000_000);
+}
+
+#[test]
+#[should_panic(expected = "InvalidReferrerFeeShareBps")]
+fn test_referrer_fee_share_rejects_over_full() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_referrer_fee_share_bps(&company, &10_001);
+}
+
+// ============================================================
+// ISSUE #548 — RECRUITER PAYOUT DESTINATION
+// ============================================================
+
+#[test]
+fn test_recruiter_payout_destination_receives_payout() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DEST", default_config(),
+    );
+
+    let wallet = Address::generate(&env);
+    client.set_recruiter_payout_address(&recruiter, &Some(wallet.clone()));
+    assert_eq!(client.get_recruiter_payout_address(&recruiter), Some(wallet.clone()));
+    submit_and_confirm_placement(&env, &client, &company, &recruiter, "ENG-DEST");
+
+    assert_eq!(token_client.balance(&wallet), 1_000_000_000);
+    assert_eq!(token_client.balance(&recruiter), 0);
+}
+
+#[test]
+fn test_clearing_recruiter_payout_destination_pays_recruiter() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DEST-CLR", default_config(),
+    );
+
+    let wallet = Address::generate(&env);
+    client.set_recruiter_payout_address(&recruiter, &Some(wallet.clone()));
+    client.set_recruiter_payout_address(&recruiter, &None);
+    assert_eq!(client.get_recruiter_payout_address(&recruiter), None);
+    submit_and_confirm_placement(&env, &client, &company, &recruiter, "ENG-DEST-CLR");
+
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+    assert_eq!(token_client.balance(&wallet), 0);
+}
+
+#[test]
+fn test_recruiter_transfer_does_not_carry_payout_destination() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DEST-XFER", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-DEST-XFER");
+
+    let wallet = Address::generate(&env);
+    client.set_recruiter_payout_address(&recruiter, &Some(wallet.clone()));
+    let new_recruiter = Address::generate(&env);
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+    submit_and_confirm_placement(&env, &client, &company, &new_recruiter, "ENG-DEST-XFER");
+
+    assert_eq!(token_client.balance(&new_recruiter), 1_000_000_000);
+    assert_eq!(token_client.balance(&wallet), 0);
+}
+
+// ============================================================
+// ISSUE #550 — PARTIAL MILESTONE CONFIRMATION
+// ============================================================
+
+#[test]
+fn test_partial_confirmation_releases_and_refunds_exactly() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PARTIAL", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-PARTIAL");
+    let company_before = token_client.balance(&company);
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    client.propose_partial_confirmation(&company, &eng_id, &0, &4_000);
+    client.accept_partial_confirmation(&recruiter, &eng_id, &0);
+
+    let released = token_client.balance(&recruiter);
+    let refunded = token_client.balance(&company) - company_before;
+    assert_eq!(released, 400_000_000);
+    assert_eq!(refunded, 600_000_000);
+    assert_eq!(released + refunded, 1_000_000_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Confirmed);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+    assert_eq!(client.get_pending_partial_confirmation(&eng_id, &0), None);
+}
+
+#[test]
+fn test_rejected_partial_confirmation_leaves_proof_submitted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PARTIAL-REJ", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-PARTIAL-REJ");
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    client.propose_partial_confirmation(&company, &eng_id, &0, &4_000);
+    client.reject_partial_confirmation(&recruiter, &eng_id, &0);
+
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::ProofSubmitted);
+    assert_eq!(client.get_pending_partial_confirmation(&eng_id, &0), None);
+}
+
+#[test]
+#[should_panic(expected = "milestone proof not yet submitted")]
+fn test_partial_confirmation_requires_proof_submitted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PARTIAL-PEND", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-PARTIAL-PEND");
+    client.propose_partial_confirmation(&company, &eng_id, &0, &4_000);
+}
+
+#[test]
+#[should_panic(expected = "PartialConfirmationExpired")]
+fn test_partial_confirmation_expires_after_amendment_ttl() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PARTIAL-TTL", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-PARTIAL-TTL");
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    client.propose_partial_confirmation(&company, &eng_id, &0, &4_000);
+    advance_ledger(&env, client.get_amendment_ttl() + 1);
+    client.accept_partial_confirmation(&recruiter, &eng_id, &0);
+}
+
+// ============================================================
+// ISSUE #564 — MUTUAL DISPUTE SETTLEMENT
+// ============================================================
+
+#[test]
+fn test_dispute_settlement_splits_without_arbiter_fee() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    client.set_arbiter_fee(&company, &100u32);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-SETTLE", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-SETTLE");
+    let company_before = token_client.balance(&company);
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "partial work"));
+    client.propose_dispute_settlement(&recruiter, &eng_id, &0, &6_000);
+    client.accept_dispute_settlement(&company, &eng_id, &0);
+
+    assert_eq!(token_client.balance(&recruiter), 600_000_000);
+    assert_eq!(token_client.balance(&company) - company_before, 400_000_000);
+    assert_eq!(token_client.balance(&arbiter), 0);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::Resolved);
+    assert_eq!(client.get_pending_dispute_settlement(&eng_id, &0), None);
+}
+
+#[test]
+#[should_panic(expected = "no pending dispute settlement")]
+fn test_dispute_settlement_invalidated_by_vote_resolution() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-SETTLE-VOTE", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-SETTLE-VOTE");
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "first"));
+    client.propose_dispute_settlement(&recruiter, &eng_id, &0, &6_000);
+    // The arbiter rejects the proof before the company accepts.
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &false);
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p2"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "second"));
+    client.accept_dispute_settlement(&company, &eng_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_dispute_settlement_cannot_be_accepted_by_proposer_side() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_single_milestone_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-SETTLE-SELF", default_config(),
+    );
+    let eng_id = String::from_str(&env, "ENG-SETTLE-SELF");
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://p"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+    client.propose_dispute_settlement(&recruiter, &eng_id, &0, &6_000);
+    client.accept_dispute_settlement(&recruiter, &eng_id, &0);
 }
