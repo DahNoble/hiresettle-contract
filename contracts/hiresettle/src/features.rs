@@ -25,6 +25,8 @@ impl HireSettleContract {
         let key = DataKey2::CompanyBalance(company.clone(), token.clone());
         let bal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(bal + amount));
+        // Issue #578: pooled balance aggregate.
+        Self::add_token_pooled(&env, &token, amount);
         env.storage()
             .persistent()
             .extend_ttl(&key, 100_000, 6_300_000);
@@ -52,6 +54,8 @@ impl HireSettleContract {
             &company,
             &amount,
         );
+        // Issue #578: pooled balance aggregate.
+        Self::add_token_pooled(&env, &token, -amount);
         env.events().publish(
             (Symbol::new(&env, "company_balance_withdrawn"),),
             (company, token, amount),
@@ -81,6 +85,8 @@ impl HireSettleContract {
             panic!("InsufficientCompanyBalance");
         }
         env.storage().persistent().set(&key, &(bal - amount));
+        // Issue #578: pooled balance aggregate.
+        Self::add_token_pooled(env, token, -amount);
         env.storage()
             .persistent()
             .extend_ttl(&key, 100_000, 6_300_000);
@@ -99,6 +105,8 @@ impl HireSettleContract {
         let key = DataKey2::CompanyBalance(company.clone(), token.clone());
         let bal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(bal + amount));
+        // Issue #578: pooled balance aggregate.
+        Self::add_token_pooled(env, token, amount);
         env.storage()
             .persistent()
             .extend_ttl(&key, 100_000, 6_300_000);

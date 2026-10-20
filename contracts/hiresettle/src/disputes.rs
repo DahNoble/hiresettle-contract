@@ -491,6 +491,8 @@ impl HireSettleContract {
         arbiter: Option<&Address>,
     ) {
         engagement.released_amount += payment;
+        // Issue #578: dispute payout releases escrow.
+        Self::add_token_locked(env, &engagement.token, -payment);
 
         let effective_bps = Self::payout_fee_bps(env, engagement_id, engagement);
         let platform_fee_amount =
@@ -1346,6 +1348,8 @@ impl HireSettleContract {
         if approve {
             let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
             engagement.released_amount += payment;
+            // Issue #578: dispute payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
             let platform_fee_amount =
@@ -1586,6 +1590,8 @@ impl HireSettleContract {
 
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         engagement.released_amount += payment;
+        // Issue #578: dispute payout releases escrow.
+        Self::add_token_locked(&env, &engagement.token, -payment);
 
         let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
         let platform_fee_amount =
@@ -1996,6 +2002,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
+        // Issue #578: payout releases escrow.
+        Self::add_token_locked(&env, &engagement.token, -payment);
 
         let token_client = token::Client::new(&env, &engagement.token);
         if fee_amount > 0 {

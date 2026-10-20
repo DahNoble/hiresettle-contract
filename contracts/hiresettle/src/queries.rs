@@ -94,6 +94,27 @@ impl HireSettleContract {
         engagement.total_amount - engagement.released_amount
     }
 
+    /// Total value locked for `token` (issue #578): the running sum of
+    /// `total_amount - released_amount` over that token's engagements,
+    /// maintained incrementally on funding, top-up and every payout, so it
+    /// always equals the sum of `get_escrow_balance` across those
+    /// engagements. Never negative (clamped at zero). Read-only.
+    pub fn get_token_tvl(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::TokenLocked(token))
+            .unwrap_or(0)
+    }
+
+    /// Total pooled company balances held for `token` (issue #472 pots),
+    /// tracked separately from engagement escrow (issue #578). Read-only.
+    pub fn get_token_pooled_balance(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::TokenPooled(token))
+            .unwrap_or(0)
+    }
+
     /// Returns `true` if the milestone is `Locked` and the current ledger
     /// sequence is greater than or equal to its `valid_after_ledger`, meaning
     /// it can currently be unlocked via `unlock_milestone`.

@@ -456,6 +456,8 @@ impl HireSettleContract {
             let token_client = token::Client::new(&env, &token);
             token_client.transfer(&company, &env.current_contract_address(), &total_amount);
         }
+        // Issue #578: new engagement escrow locked (pool funds were never in TVL).
+        Self::add_token_locked(&env, &token, total_amount);
 
         // Issue #459: escrow the optional recruiter bond alongside the company's funding.
         if let Some(bond_amount) = config.recruiter_bond_amount {
@@ -1125,6 +1127,8 @@ impl HireSettleContract {
         token_client.transfer(&company, &env.current_contract_address(), &amount);
 
         engagement.total_amount += amount;
+        // Issue #578: top-up locks more escrow.
+        Self::add_token_locked(&env, &engagement.token, amount);
         engagement.last_activity_ledger = env.ledger().sequence();
 
         env.storage()

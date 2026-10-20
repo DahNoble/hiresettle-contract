@@ -488,6 +488,8 @@ pub enum DataKey2 {
     PartyDisputeStats(Address),
     /// Total escrow currently locked per token across engagements (issue #578).
     TokenLocked(Address),
+    /// Total pooled company balances per token (issue #578), separate from escrow.
+    TokenPooled(Address),
     /// Engagement IDs denominated in a token, in creation order, forward-only
     /// (issue #577). No backfill for engagements created before deployment.
     TokenEngagements(Address),
