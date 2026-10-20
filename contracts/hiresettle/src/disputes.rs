@@ -275,6 +275,120 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #565 — DISPUTE WITHDRAWAL
+    // ----------------------------------------------------------
+
+    /// The company withdraws a dispute it raised, as long as no arbiter has
+    /// voted on it yet. The milestone returns to `ProofSubmitted` with its
+    /// confirm (and dispute) window restarted from the withdrawal ledger, so
+    /// the company can still confirm and `force_confirm_milestone` cannot
+    /// fire immediately.
+    ///
+    /// The withdrawn dispute still counts toward the milestone's dispute
+    /// cycle cap (issue #481) and stays in `get_dispute_history` with its
+    /// `withdrawn_at` ledger set (issue #501).
+    ///
+    /// # Panics
+    /// - `"EngagementPaused"` — the engagement has been paused by the admin.
+    /// - `"engagement not found"` / `"engagement is not active"` /
+    ///   `"unauthorized"` — same as `raise_dispute`.
+    /// - `"invalid milestone index"`.
+    /// - `"milestone is not in disputed status"`.
+    /// - `"VotesAlreadyCast"` — any binary, split or super-arbiter panel vote
+    ///   has been cast on the dispute.
+    ///
+    /// # Events
+    /// Emits `milestone_status_changed` (`Disputed` → `ProofSubmitted`) and
+    /// `("dispute_withdrawn", engagement_id)` with `milestone_index`.
+    pub fn withdraw_dispute(
+        env: Env,
+        company: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
+        company.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+
+        let votes_cast = env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArbiterVotes(engagement_id.clone(), milestone_index))
+            || env.storage().persistent().has(&DataKey2::ArbiterSplitVotes(
+                engagement_id.clone(),
+                milestone_index,
+            ))
+            || env.storage().persistent().has(&DataKey2::SuperArbiterVotes(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+        if votes_cast {
+            panic!("VotesAlreadyCast");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        milestone.status = MilestoneStatus::ProofSubmitted;
+        milestone.proof_submitted_at = current_ledger;
+        engagement.milestones.set(milestone_index, milestone);
+
+        // Clear the dispute's live state. `DisputeCycles` is deliberately left
+        // untouched so the withdrawal counts toward the cap (issue #481).
+        env.storage().persistent().remove(&DataKey::DisputeReason(
+            engagement_id.clone(),
+            milestone_index,
+        ));
+        env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+            engagement_id.clone(),
+            milestone_index,
+        ));
+        env.storage().persistent().remove(&DataKey::EscalatedDispute(
+            engagement_id.clone(),
+            milestone_index,
+        ));
+        env.storage().persistent().remove(&DataKey::EscalatedAt(
+            engagement_id.clone(),
+            milestone_index,
+        ));
+        Self::clear_recused_arbiters(&env, &engagement_id, milestone_index);
+
+        Self::record_dispute_withdrawn(&env, &engagement_id, milestone_index);
+
+        engagement.last_activity_ledger = current_ledger;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            MilestoneStatus::Disputed,
+            MilestoneStatus::ProofSubmitted,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "dispute_withdrawn"), engagement_id.clone()),
+            milestone_index,
+        );
+    }
+
+    // ----------------------------------------------------------
     // CAST ARBITER VOTE  (#10 multi-arbiter quorum)
     // ----------------------------------------------------------
 
@@ -353,6 +467,7 @@ impl HireSettleContract {
 
         let weight = Self::arbiter_weight(&engagement, slot_index);
         record.voted.push_back(arbiter.clone());
+        record.approvals.push_back(approve);
         Self::record_arbiter_vote(&env, &arbiter, &engagement_id, milestone_index);
         if approve {
             record.approve_votes += 1;
@@ -362,40 +477,183 @@ impl HireSettleContract {
             record.reject_weight += weight;
         }
 
-        let total_weight =
-            Self::active_arbiter_weight(&env, &engagement, &engagement_id, milestone_index);
-        let quorum = engagement.quorum;
-
         env.events().publish(
             (Symbol::new(&env, "arbiter_voted"), engagement_id.clone()),
             (milestone_index, approve),
         );
 
+        Self::settle_binary_vote(
+            &env,
+            &mut engagement,
+            &engagement_id,
+            milestone_index,
+            &record,
+            &arbiter,
+            &caller,
+        );
+
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+    }
+
+    /// Resolve the dispute if `record` has reached either quorum, otherwise
+    /// persist the updated tally. Shared by `cast_arbiter_vote` and
+    /// `change_arbiter_vote` so a changed vote that reaches quorum resolves
+    /// exactly like a fresh one. The caller persists `engagement`.
+    fn settle_binary_vote(
+        env: &Env,
+        engagement: &mut Engagement,
+        engagement_id: &String,
+        milestone_index: u32,
+        record: &ArbiterVoteRecord,
+        arbiter: &Address,
+        caller: &Address,
+    ) {
+        let total_weight =
+            Self::active_arbiter_weight(env, engagement, engagement_id, milestone_index);
+        let quorum = engagement.quorum;
+
         if record.approve_weight >= quorum {
+            let milestone = engagement.milestones.get(milestone_index).unwrap();
             let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
             Self::release_dispute_payout(
-                &env,
-                &mut engagement,
-                &engagement_id,
+                env,
+                engagement,
+                engagement_id,
                 milestone_index,
                 payment,
-                Some(&arbiter),
+                Some(arbiter),
             );
-            Self::finish_dispute_resolved(
-                &env,
-                &mut engagement,
-                &engagement_id,
-                milestone_index,
-                &caller,
-            );
+            Self::finish_dispute_resolved(env, engagement, engagement_id, milestone_index, caller);
         } else if record.reject_weight > total_weight - quorum {
-            Self::finish_dispute_rejected(&env, &mut engagement, &engagement_id, milestone_index);
+            Self::finish_dispute_rejected(env, engagement, engagement_id, milestone_index);
         } else {
-            env.storage().persistent().set(&vote_key, &record);
+            let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), milestone_index);
+            env.storage().persistent().set(&vote_key, record);
             env.storage()
                 .persistent()
                 .extend_ttl(&vote_key, 100_000, 6_300_000);
         }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #559 — ARBITER VOTE CHANGE
+    // ----------------------------------------------------------
+
+    /// An arbiter (or their vote delegate, issue #463) flips the binary vote
+    /// they already cast on a still-`Disputed` milestone, moving their weight
+    /// from one side of the tally to the other. Each arbiter slot may change
+    /// its vote at most once per dispute.
+    ///
+    /// If the change brings either side to quorum, the dispute resolves
+    /// exactly as it would have on a fresh `cast_arbiter_vote` (payout, fees,
+    /// storage cleanup and events).
+    ///
+    /// # Panics
+    /// - `"engagement is not active"` / `"milestone is not in disputed status"`.
+    /// - `"unauthorized"` — caller is neither an arbiter nor an arbiter's delegate.
+    /// - `"ArbiterRecused"` — the arbiter recused from this dispute.
+    /// - `"NotVoted"` — the arbiter has not cast a binary vote on this dispute.
+    /// - `"VoteUnchanged"` — `approve` matches the arbiter's current vote.
+    /// - `"VoteAlreadyChanged"` — the arbiter already changed their vote once.
+    ///
+    /// # Events
+    /// Emits `("arbiter_vote_changed", engagement_id)` with
+    /// `(milestone_index, arbiter, approve)`.
+    pub fn change_arbiter_vote(
+        env: Env,
+        arbiter: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        approve: bool,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_milestone_not_on_hold(&env, &engagement_id, milestone_index);
+        arbiter.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let caller = arbiter;
+        let (arbiter, slot_index) =
+            Self::resolve_voting_arbiter(&env, &engagement, &engagement_id, &caller);
+
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+
+        if Self::is_arbiter_recused(&env, &engagement_id, milestone_index, &arbiter) {
+            panic!("ArbiterRecused");
+        }
+
+        let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), milestone_index);
+        let mut record: ArbiterVoteRecord = env
+            .storage()
+            .persistent()
+            .get(&vote_key)
+            .unwrap_or_else(|| panic!("NotVoted"));
+
+        let mut position: Option<u32> = None;
+        for i in 0..record.voted.len() {
+            if record.voted.get(i).unwrap() == arbiter {
+                position = Some(i);
+                break;
+            }
+        }
+        let position = position.unwrap_or_else(|| panic!("NotVoted"));
+        let previous = record
+            .approvals
+            .get(position)
+            .unwrap_or_else(|| panic!("NotVoted"));
+
+        if previous == approve {
+            panic!("VoteUnchanged");
+        }
+        if record.changed.contains(&arbiter) {
+            panic!("VoteAlreadyChanged");
+        }
+
+        let weight = Self::arbiter_weight(&engagement, slot_index);
+        if approve {
+            record.reject_votes -= 1;
+            record.reject_weight -= weight;
+            record.approve_votes += 1;
+            record.approve_weight += weight;
+        } else {
+            record.approve_votes -= 1;
+            record.approve_weight -= weight;
+            record.reject_votes += 1;
+            record.reject_weight += weight;
+        }
+        record.approvals.set(position, approve);
+        record.changed.push_back(arbiter.clone());
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "arbiter_vote_changed"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, arbiter.clone(), approve),
+        );
+
+        Self::settle_binary_vote(
+            &env,
+            &mut engagement,
+            &engagement_id,
+            milestone_index,
+            &record,
+            &arbiter,
+            &caller,
+        );
 
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()

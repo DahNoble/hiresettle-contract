@@ -480,5 +480,7 @@ pub enum DataKey2 {
     /// `escalate_dispute` skip the dispute-window wait. Cleared with the
     /// dispute's recusals.
     VoteDeadlineEnforced(String, u32),
+    /// Pending negotiated cancellation proposal for an engagement (issue #576).
+    CancellationProposal(String),
 }
 

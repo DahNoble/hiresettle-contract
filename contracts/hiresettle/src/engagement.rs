@@ -1096,16 +1096,276 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #576 — NEGOTIATED MUTUAL CANCELLATION
+    // ----------------------------------------------------------
+
+    /// Either side proposes cancelling the engagement with
+    /// `recruiter_bps_of_unreleased` basis points of the unreleased escrow
+    /// paid to the recruiter as compensation for partial work; the other side
+    /// accepts with [`Self::accept_cancellation`]. A new proposal replaces any
+    /// pending one. The proposal expires after the amendment TTL
+    /// (`get_amendment_ttl`).
+    ///
+    /// `cancel_engagement` is unchanged and still refunds everything.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` / `"EngagementPaused"`
+    /// - `"InvalidCancellationBps"` — `recruiter_bps_of_unreleased > 10_000`
+    /// - `"engagement is not active"` — not `Active` / `ReplacementRequested`
+    /// - `"unauthorized"` — caller is neither the company side nor the recruiter side
+    /// - `"MilestoneDisputed"` — a milestone is currently `Disputed`
+    ///
+    /// # Events
+    /// Emits `("cancellation_proposed", engagement_id)` with
+    /// `(proposer, recruiter_bps_of_unreleased, expires_at_ledger)`.
+    pub fn propose_cancellation(
+        env: Env,
+        proposer: Address,
+        engagement_id: String,
+        recruiter_bps_of_unreleased: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        proposer.require_auth();
+
+        if recruiter_bps_of_unreleased > FULL_SPLIT_BPS {
+            panic!("InvalidCancellationBps");
+        }
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        Self::assert_negotiated_cancellation_allowed(&engagement);
+
+        let proposed_by_company =
+            if Self::is_authorized_company(&env, &proposer, &engagement.company) {
+                true
+            } else if Self::is_authorized_recruiter(&env, &proposer, &engagement.recruiter) {
+                false
+            } else {
+                panic!("{}", ERR_UNAUTHORIZED);
+            };
+
+        let ttl = Self::get_amendment_ttl(env.clone());
+        let now = env.ledger().sequence();
+        let proposal = CancellationProposal {
+            proposer: proposer.clone(),
+            proposed_by_company,
+            recruiter_bps: recruiter_bps_of_unreleased,
+            proposed_at_ledger: now,
+            expires_at_ledger: now.saturating_add(ttl),
+        };
+        let key = DataKey2::CancellationProposal(engagement_id.clone());
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "cancellation_proposed"),
+                engagement_id,
+            ),
+            (proposer, recruiter_bps_of_unreleased, proposal.expires_at_ledger),
+        );
+    }
+
+    /// The counterparty of a pending [`Self::propose_cancellation`] accepts it.
+    ///
+    /// `recruiter_bps` of the unreleased escrow (excluding any share withheld
+    /// by a split-vote dispute resolution, which always goes back to the
+    /// company) is released to the recruiter side through the regular fee
+    /// pipeline — platform fee, then the co-recruiter split and payout
+    /// preferences. Everything else is refunded to the company (to its pool
+    /// for pool-funded engagements) and the engagement becomes `Cancelled`.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` / `"EngagementPaused"`
+    /// - `"no pending cancellation proposal"`
+    /// - `"cancellation_expired"` — the proposal outlived the amendment TTL
+    ///   (it is discarded)
+    /// - `"engagement is not active"` / `"MilestoneDisputed"`
+    /// - `"unauthorized"` — caller is not on the other side from the proposer
+    ///
+    /// # Events
+    /// Emits `engagement_status_changed`, then
+    /// `("cancellation_accepted", engagement_id)` with
+    /// `(acceptor, recruiter_bps, recruiter_amount, refund)` and
+    /// `("engagement_cancelled", engagement_id)` with `refund`.
+    pub fn accept_cancellation(env: Env, acceptor: Address, engagement_id: String) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+        acceptor.require_auth();
+
+        let key = DataKey2::CancellationProposal(engagement_id.clone());
+        let proposal: CancellationProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending cancellation proposal"));
+
+        if env.ledger().sequence() > proposal.expires_at_ledger {
+            env.storage().persistent().remove(&key);
+            panic!("cancellation_expired");
+        }
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+        Self::assert_negotiated_cancellation_allowed(&engagement);
+
+        let is_counterparty = if proposal.proposed_by_company {
+            Self::is_authorized_recruiter(&env, &acceptor, &engagement.recruiter)
+        } else {
+            Self::is_authorized_company(&env, &acceptor, &engagement.company)
+        };
+        if !is_counterparty {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let unreleased = engagement.total_amount - engagement.released_amount;
+        // Issue #462: a split-vote resolution's withheld share was already
+        // decided in the company's favour, so it is not up for negotiation.
+        let withheld_key = DataKey2::SplitWithheld(engagement_id.clone());
+        let withheld: i128 = env
+            .storage()
+            .persistent()
+            .get::<DataKey2, i128>(&withheld_key)
+            .unwrap_or(0)
+            .max(0)
+            .min(unreleased.max(0));
+        env.storage().persistent().remove(&withheld_key);
+
+        let recruiter_amount =
+            ((unreleased - withheld) * proposal.recruiter_bps as i128) / (FULL_SPLIT_BPS as i128);
+        if recruiter_amount > 0 {
+            let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
+            let fee_amount =
+                Self::platform_fee_amount(&env, &engagement_id, recruiter_amount, effective_bps);
+            let net_payment = recruiter_amount - fee_amount;
+            engagement.released_amount += recruiter_amount;
+
+            let token_client = token::Client::new(&env, &engagement.token);
+            if fee_amount > 0 {
+                Self::collect_platform_fee(
+                    &env,
+                    &engagement,
+                    &engagement_id,
+                    CANCELLATION_FEE_MILESTONE_INDEX,
+                    fee_amount,
+                );
+            }
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client, true);
+        }
+
+        let refund = unreleased - recruiter_amount;
+        // Issue #472: pool-funded engagements refund to the pool by default.
+        Self::refund_company_escrow(&env, &engagement, &engagement_id, refund);
+
+        let old_engagement_status = engagement.status.clone();
+        engagement.status = EngagementStatus::Cancelled;
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+        env.storage().persistent().remove(&key);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+            Some(acceptor.clone()),
+        );
+
+        Self::decrement_company_active_count(&env, &engagement.company);
+        Self::settle_bonds(&env, &engagement);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "cancellation_accepted"),
+                engagement_id.clone(),
+            ),
+            (acceptor, proposal.recruiter_bps, recruiter_amount, refund),
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_cancelled"),
+                engagement_id.clone(),
+            ),
+            refund,
+        );
+    }
+
+    /// Return the pending negotiated cancellation, or `None` if absent/expired.
+    pub fn get_pending_cancellation(
+        env: Env,
+        engagement_id: String,
+    ) -> Option<CancellationProposal> {
+        let proposal: CancellationProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::CancellationProposal(engagement_id))?;
+        if env.ledger().sequence() > proposal.expires_at_ledger {
+            return None;
+        }
+        Some(proposal)
+    }
+
+    /// Panic unless a negotiated cancellation may be proposed or accepted:
+    /// the engagement must be `Active` or `ReplacementRequested` (as for
+    /// `cancel_engagement`) and no milestone may be `Disputed`.
+    fn assert_negotiated_cancellation_allowed(engagement: &Engagement) {
+        if engagement.status != EngagementStatus::Active
+            && engagement.status != EngagementStatus::ReplacementRequested
+        {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+        for i in 0..engagement.milestones.len() {
+            if engagement.milestones.get(i).unwrap().status == MilestoneStatus::Disputed {
+                panic!("MilestoneDisputed");
+            }
+        }
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #33 — ESCROW TOP-UP
     // ----------------------------------------------------------
 
     /// Company tops up the escrow balance for an active engagement.
     pub fn top_up_escrow(env: Env, company: Address, engagement_id: String, amount: i128) {
-        Self::assert_not_paused(&env);
-        Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::apply_escrow_top_up(&env, &company, &engagement_id, amount, false);
+    }
+
+    /// Issue #545: company tops up the escrow balance for an active engagement
+    /// by debiting its pooled balance for the engagement's token
+    /// (`get_company_balance(company, engagement.token)`) instead of
+    /// performing a fresh token transfer.
+    ///
+    /// # Panics
+    /// Same as [`Self::top_up_escrow`], plus `"InsufficientCompanyBalance"`
+    /// (without mutating state) if the pool cannot cover `amount`.
+    pub fn top_up_escrow_from_pool(
+        env: Env,
+        company: Address,
+        engagement_id: String,
+        amount: i128,
+    ) {
+        Self::apply_escrow_top_up(&env, &company, &engagement_id, amount, true);
+    }
+
+    /// Shared body of `top_up_escrow` / `top_up_escrow_from_pool`: validates the
+    /// caller and engagement, funds `amount` either from a token transfer or
+    /// the company pool, and grows `total_amount` by exactly `amount`.
+    pub(crate) fn apply_escrow_top_up(
+        env: &Env,
+        company: &Address,
+        engagement_id: &String,
+        amount: i128,
+        from_pool: bool,
+    ) {
+        Self::assert_not_paused(env);
+        Self::assert_engagement_not_paused(env, engagement_id);
         company.require_auth();
 
-        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let mut engagement = Self::get_engagement_internal(env, engagement_id);
 
         if engagement.status != EngagementStatus::Active
             && engagement.status != EngagementStatus::ReplacementRequested
@@ -1113,7 +1373,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_authorized_company(env, company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1121,8 +1381,13 @@ impl HireSettleContract {
             panic!("amount must be greater than zero");
         }
 
-        let token_client = token::Client::new(&env, &engagement.token);
-        token_client.transfer(&company, &env.current_contract_address(), &amount);
+        if from_pool {
+            // Panics before any write if the pooled balance is insufficient.
+            Self::debit_company_pool(env, company, &engagement.token, amount);
+        } else {
+            let token_client = token::Client::new(env, &engagement.token);
+            token_client.transfer(company, &env.current_contract_address(), &amount);
+        }
 
         engagement.total_amount += amount;
         engagement.last_activity_ledger = env.ledger().sequence();
@@ -1130,11 +1395,11 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
-        Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::extend_engagement_ttl(env, engagement_id);
 
         env.events().publish(
-            (Symbol::new(&env, "escrow_topped_up"), engagement_id.clone()),
-            (amount, engagement.total_amount),
+            (Symbol::new(env, "escrow_topped_up"), engagement_id.clone()),
+            (amount, engagement.total_amount, from_pool),
         );
     }
 

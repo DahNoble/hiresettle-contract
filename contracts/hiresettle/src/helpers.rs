@@ -450,6 +450,8 @@ impl HireSettleContract {
             voted: Vec::new(env),
             approve_weight: 0,
             reject_weight: 0,
+            approvals: Vec::new(env),
+            changed: Vec::new(env),
         }
     }
 

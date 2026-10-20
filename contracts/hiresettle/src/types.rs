@@ -164,6 +164,12 @@ pub struct ArbiterVoteRecord {
     /// Cumulative weight of rejecting arbiters (issue #460). Equals
     /// `reject_votes` when the engagement has no `arbiter_weights`.
     pub reject_weight: u32,
+    /// Side of each vote in `voted`, by position: `true` = approve (issue #559).
+    /// Lets `change_arbiter_vote` move the arbiter's weight to the other side.
+    pub approvals: Vec<bool>,
+    /// Arbiter slots that have already used their one `change_arbiter_vote`
+    /// on this dispute (issue #559).
+    pub changed: Vec<Address>,
 }
 /// Returned by `get_arbiter_vote_weights` (issue #460).
 #[contracttype]
@@ -458,6 +464,23 @@ pub struct SplitAmendmentProposal {
     /// Last ledger at which the proposal can still be accepted.
     pub expires_at_ledger: u32,
 }
+/// Pending negotiated cancellation (issue #576), returned by
+/// `get_pending_cancellation`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CancellationProposal {
+    /// Address that proposed the cancellation.
+    pub proposer: Address,
+    /// `true` if the company side proposed; `false` if the recruiter side did.
+    pub proposed_by_company: bool,
+    /// Share of the unreleased escrow, in basis points (≤ 10_000), paid to the
+    /// recruiter side on acceptance; the rest is refunded to the company.
+    pub recruiter_bps: u32,
+    /// Ledger at which the proposal was made.
+    pub proposed_at_ledger: u32,
+    /// Last ledger at which the proposal can still be accepted.
+    pub expires_at_ledger: u32,
+}
 /// History entry recorded when a split amendment is accepted (issue #471).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -519,6 +542,9 @@ pub struct DisputeHistoryEntry {
     pub reason: String,
     /// Ledger at which the dispute was raised.
     pub ledger: u32,
+    /// Ledger at which the company withdrew the dispute via
+    /// `withdraw_dispute` (issue #565); `None` if it was not withdrawn.
+    pub withdrawn_at: Option<u32>,
 }
 /// One entry of `get_status_history` (issue #501).
 #[contracttype]

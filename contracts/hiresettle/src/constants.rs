@@ -54,6 +54,10 @@ pub(crate) const ARBITER_RESPONSE_REFERENCE_LEDGERS: u64 = 17_280;
 pub(crate) const DISPUTE_WINDOW_PROPOSAL_TTL_LEDGERS: u32 = 17_280;
 /// Default TTL for amendment / split-amendment proposals (~1 day).
 pub(crate) const DEFAULT_AMENDMENT_TTL_LEDGERS: u32 = 17_280;
+/// `milestone_index` reported in `platform_fee_collected` for the fee taken on
+/// a negotiated cancellation's recruiter compensation (issue #576), which is
+/// not tied to any single milestone.
+pub(crate) const CANCELLATION_FEE_MILESTONE_INDEX: u32 = u32::MAX;
 /// FIFO cap on per-engagement split amendment log entries (issue #471).
 pub(crate) const MAX_AMENDMENT_LOG_ENTRIES: u32 = 20;
 /// FIFO cap on per-engagement dispute history entries (issue #501).

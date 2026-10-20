@@ -122,11 +122,41 @@ impl HireSettleContract {
             raised_by: raised_by.clone(),
             reason: reason.clone(),
             ledger: env.ledger().sequence(),
+            withdrawn_at: None,
         });
         env.storage().persistent().set(&key, &log);
         env.storage()
             .persistent()
             .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    /// Mark the most recent dispute on `milestone_index` as withdrawn
+    /// (issue #565). A no-op if that entry already aged out of the FIFO cap.
+    pub(crate) fn record_dispute_withdrawn(
+        env: &Env,
+        engagement_id: &String,
+        milestone_index: u32,
+    ) {
+        let key = DataKey2::DisputeHistory(engagement_id.clone());
+        let mut log: Vec<DisputeHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut i = log.len();
+        while i > 0 {
+            i -= 1;
+            let mut entry = log.get(i).unwrap();
+            if entry.milestone_index == milestone_index {
+                entry.withdrawn_at = Some(env.ledger().sequence());
+                log.set(i, entry);
+                env.storage().persistent().set(&key, &log);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, 100_000, 6_300_000);
+                return;
+            }
+        }
     }
 
     pub(crate) fn record_status_change(
