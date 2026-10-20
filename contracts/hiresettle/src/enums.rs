@@ -480,5 +480,16 @@ pub enum DataKey2 {
     /// `escalate_dispute` skip the dispute-window wait. Cleared with the
     /// dispute's recusals.
     VoteDeadlineEnforced(String, u32),
+    /// Ledger until which a pool arbiter is suspended from new panel draws
+    /// (issue #562). Absent ⇒ not suspended. Expires automatically: a stored
+    /// `until_ledger` at or below the current ledger counts as not suspended.
+    ArbiterSuspension(Address),
+    /// Per-party dispute counters (issue #581).
+    PartyDisputeStats(Address),
+    /// Total escrow currently locked per token across engagements (issue #578).
+    TokenLocked(Address),
+    /// Engagement IDs denominated in a token, in creation order, forward-only
+    /// (issue #577). No backfill for engagements created before deployment.
+    TokenEngagements(Address),
 }
 

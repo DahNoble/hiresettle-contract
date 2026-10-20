@@ -63,6 +63,81 @@ impl HireSettleContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    // ----------------------------------------------------------
+    // ISSUE #562 — ARBITER POOL MEMBER SUSPENSION
+    // ----------------------------------------------------------
+
+    /// Suspend a pool member from new panel draws until `until_ledger`.
+    /// Suspended members keep their stats history and stay seated on panels
+    /// already drawn; only future draws skip them. Suspension expires
+    /// automatically once `until_ledger` is reached (lazy check, no cleanup).
+    ///
+    /// # Panics
+    /// - `"NotInPool"` — the address is not a pool member.
+    /// - `"InvalidUntilLedger"` — `until_ledger` is not in the future.
+    pub fn suspend_arbiter_pool_member(
+        env: Env,
+        admin: Address,
+        arbiter: Address,
+        until_ledger: u32,
+    ) {
+        Self::assert_admin(&env, &admin);
+        if !Self::get_arbiter_pool(env.clone()).contains(&arbiter) {
+            panic!("NotInPool");
+        }
+        if until_ledger <= env.ledger().sequence() {
+            panic!("InvalidUntilLedger");
+        }
+        let key = DataKey2::ArbiterSuspension(arbiter.clone());
+        env.storage().persistent().set(&key, &until_ledger);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_suspended"),),
+            (arbiter, until_ledger),
+        );
+    }
+
+    /// Lift a pool member's suspension early. No-op when not suspended.
+    ///
+    /// # Panics
+    /// - `"NotInPool"` — the address is not a pool member.
+    pub fn unsuspend_arbiter_pool_member(env: Env, admin: Address, arbiter: Address) {
+        Self::assert_admin(&env, &admin);
+        if !Self::get_arbiter_pool(env.clone()).contains(&arbiter) {
+            panic!("NotInPool");
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::ArbiterSuspension(arbiter.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "arbiter_unsuspended"),), arbiter);
+    }
+
+    /// Return the ledger until which `arbiter` is suspended, or `None` when
+    /// not suspended (including when a past suspension has expired).
+    pub fn get_arbiter_suspension(env: Env, arbiter: Address) -> Option<u32> {
+        let until: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::ArbiterSuspension(arbiter))?;
+        if until > env.ledger().sequence() {
+            Some(until)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `arbiter` is currently suspended from new panel draws.
+    pub(crate) fn is_arbiter_suspended(env: &Env, arbiter: &Address) -> bool {
+        let until: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::ArbiterSuspension(arbiter.clone()));
+        until.map_or(false, |u| u > env.ledger().sequence())
+    }
+
     fn set_arbiter_pool(env: &Env, pool: &Vec<Address>) {
         env.storage().persistent().set(&DataKey::ArbiterPool, pool);
         env.storage()
@@ -156,7 +231,12 @@ impl HireSettleContract {
         let mut candidates: Vec<Address> = Vec::new(env);
         let mut weights: Vec<u32> = Vec::new(env);
         for member in pool.iter() {
-            if member != *company && member != *recruiter {
+            // Issue #562: suspended members sit out future draws but keep
+            // their stats (and stay seated on already-drawn panels).
+            if member != *company
+                && member != *recruiter
+                && !Self::is_arbiter_suspended(env, &member)
+            {
                 weights.push_back(Self::selection_weight(env, &member));
                 candidates.push_back(member);
             }
