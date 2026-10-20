@@ -622,6 +622,25 @@ impl HireSettleContract {
             6_300_000,
         );
 
+        // Issue #577: append engagement_id to the per-token index.
+        // Forward-only: engagements created before this deployment are not
+        // backfilled and never appear in this index.
+        let mut token_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TokenEngagements(engagement.token.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        token_ids.push_back(engagement_id.clone());
+        env.storage().persistent().set(
+            &DataKey2::TokenEngagements(engagement.token.clone()),
+            &token_ids,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey2::TokenEngagements(engagement.token.clone()),
+            100_000,
+            6_300_000,
+        );
+
         if let Some(ref bundle_id) = config.bundle_id {
             Self::add_bundle_member(&env, bundle_id, &engagement_id);
         }

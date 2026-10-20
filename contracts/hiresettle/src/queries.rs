@@ -364,6 +364,50 @@ impl HireSettleContract {
         ids.len()
     }
 
+    /// Return a paginated slice of engagement IDs denominated in `token`
+    /// (issue #577), for treasury and analytics dashboards. `page` is
+    /// 0-indexed; out-of-range pages return an empty vec. Forward-only: only
+    /// engagements created after this index was introduced are listed.
+    pub fn get_engagements_by_token(
+        env: Env,
+        token: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<String> {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TokenEngagements(token))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = ids.len();
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(ids.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Return the total number of engagements denominated in `token`
+    /// (issue #577). Companion to `get_engagements_by_token` for sizing
+    /// pagination. Returns `0` for a token with no indexed engagements.
+    pub fn get_engagement_count_by_token(env: Env, token: Address) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TokenEngagements(token))
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.len()
+    }
+
     // ----------------------------------------------------------
     // ISSUE #34 — ENGAGEMENT COUNT
     // ----------------------------------------------------------
