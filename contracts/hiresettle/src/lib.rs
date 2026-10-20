@@ -7,6 +7,17 @@ use soroban_sdk::{
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
 const MAX_ARBITER_FEE_BPS: u32 = 200;
 const FULL_SPLIT_BPS: u32 = 10_000;
+/// Per-function pause ids for `set_function_paused` (issue #589). They share
+/// the same `u32` id scheme as the sensitive setters but live in a disjoint
+/// range so the two features never collide.
+const FN_CREATE_ENGAGEMENT: u32 = 10;
+const FN_CONFIRM_MILESTONE: u32 = 11;
+const FN_BATCH_CONFIRM_MILESTONES: u32 = 12;
+const FN_RAISE_DISPUTE: u32 = 13;
+const FN_SUBMIT_PROOF: u32 = 14;
+const FN_CANCEL_ENGAGEMENT: u32 = 15;
+const FN_TOP_UP_ESCROW: u32 = 16;
+const FN_UNLOCK_MILESTONE: u32 = 17;
 
 // ============================================================
 // DATA TYPES
@@ -605,6 +616,9 @@ pub enum ConfigKey {
     /// Role of a company team member, scoped to `(company, member)`
     /// (issue #575). Absent means the address is not a team member.
     CompanyMember(Address, Address),
+    /// Per-function pause flag for `fn_id` (issue #589). Present and `true`
+    /// means the entry point is paused; absent means it runs normally.
+    FunctionPaused(u32),
 }
 
 /// Contract storage key space. Instance keys reset between transactions;
@@ -1054,6 +1068,39 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #589 — PER-FUNCTION PAUSE
+    // ----------------------------------------------------------
+
+    /// Pause or unpause a single state-changing entry point identified by
+    /// `fn_id` (same `u32` id scheme as the sensitive setters, e.g.
+    /// `FN_CREATE_ENGAGEMENT`), without halting the rest of the contract.
+    /// Each guarded entry point checks its id in addition to the global and
+    /// per-engagement pauses; read-only queries are never pausable. The
+    /// global pause still overrides everything.
+    ///
+    /// # Events
+    /// `("function_pause_set",)` with `(fn_id, paused)`.
+    pub fn set_function_paused(env: Env, admin: Address, fn_id: u32, paused: bool) {
+        Self::assert_admin(&env, &admin);
+        let key = DataKey::Config(ConfigKey::FunctionPaused(fn_id));
+        if paused {
+            env.storage().persistent().set(&key, &true);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 100_000, 6_300_000);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        env.events()
+            .publish((Symbol::new(&env, "function_pause_set"),), (fn_id, paused));
+    }
+
+    /// Return `true` if the entry point `fn_id` is currently paused.
+    pub fn is_function_paused(env: Env, fn_id: u32) -> bool {
+        Self::is_function_paused_internal(&env, fn_id)
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #239 — PER-ENGAGEMENT PAUSE (QUARANTINE)
     // ----------------------------------------------------------
 
@@ -1434,6 +1481,7 @@ impl HireSettleContract {
         config: EngagementConfig,
     ) -> String {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_CREATE_ENGAGEMENT);
         company.require_auth();
 
         // Validate engagement_id format: non-empty, ≤ 64 chars, [A-Za-z0-9-] only.
@@ -1842,6 +1890,7 @@ impl HireSettleContract {
     ///   before `valid_after_ledger`.
     pub fn unlock_milestone(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_UNLOCK_MILESTONE);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
@@ -2118,6 +2167,7 @@ impl HireSettleContract {
         proof_hash: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_SUBMIT_PROOF);
         Self::assert_engagement_not_paused(&env, &engagement_id);
 
         // Issue #20: Proof hash format validation (before require_auth for fail-fast)
@@ -2239,6 +2289,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_CONFIRM_MILESTONE);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
@@ -2430,6 +2481,7 @@ impl HireSettleContract {
         reason: String,
     ) {
         Self::assert_engagement_not_paused(&env, &engagement_id);
+        Self::assert_function_not_paused(&env, FN_RAISE_DISPUTE);
         company.require_auth();
 
         if reason.len() > 128 {
@@ -4052,6 +4104,7 @@ impl HireSettleContract {
         engagement_id: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_CANCEL_ENGAGEMENT);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
         recruiter.require_auth();
@@ -4278,6 +4331,7 @@ impl HireSettleContract {
     /// Company tops up the escrow balance for an active engagement.
     pub fn top_up_escrow(env: Env, company: Address, engagement_id: String, amount: i128) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_TOP_UP_ESCROW);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
@@ -6538,6 +6592,7 @@ impl HireSettleContract {
         milestone_indices: Vec<u32>,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_function_not_paused(&env, FN_BATCH_CONFIRM_MILESTONES);
         Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
@@ -7440,6 +7495,25 @@ impl HireSettleContract {
     fn assert_not_paused(env: &Env) {
         if Self::is_paused_internal(env) {
             panic!("ContractPaused");
+        }
+    }
+
+    /// Per-function pause flag (issue #589): `true` once the admin pauses
+    /// `fn_id` via `set_function_paused`, `false` by default. Read-only
+    /// queries never consult this flag.
+    fn is_function_paused_internal(env: &Env, fn_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::FunctionPaused(fn_id)))
+            .unwrap_or(false)
+    }
+
+    /// Guard for state-changing entry points (issue #589). Layered under the
+    /// global pause: callers check `assert_not_paused` first, so the global
+    /// pause still overrides everything.
+    fn assert_function_not_paused(env: &Env, fn_id: u32) {
+        if Self::is_function_paused_internal(env, fn_id) {
+            panic!("FunctionPaused");
         }
     }
 
