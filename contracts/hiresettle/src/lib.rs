@@ -274,6 +274,17 @@ pub struct ArbiterVoteRecord {
     pub voted: Vec<Address>,
 }
 
+/// Role of a company team member (issue #575): which company-gated actions
+/// the member may perform on any engagement of that company.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum CompanyMemberRole {
+    /// May call `confirm_milestone` / `batch_confirm_milestones`.
+    Confirmer,
+    /// May call `raise_dispute`.
+    Disputer,
+}
+
 /// Passed to `create_engagement` to configure the arbitration panel for an engagement.
 ///
 /// Soroban's 10-parameter limit prevents passing these as individual args, so they
@@ -591,6 +602,9 @@ pub enum ConfigKey {
     /// `pause_engagement` (issue #590). Cleared by `unpause_engagement`
     /// so unpausing resets the escape timer.
     QuarantineStartedAt(String),
+    /// Role of a company team member, scoped to `(company, member)`
+    /// (issue #575). Absent means the address is not a team member.
+    CompanyMember(Address, Address),
 }
 
 /// Contract storage key space. Instance keys reset between transactions;
@@ -2234,7 +2248,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_company_confirmer(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2347,6 +2361,17 @@ impl HireSettleContract {
             ),
             (milestone_index, payment),
         );
+        // Issue #575: identify the team member when the confirmer is not the
+        // company itself.
+        if Self::company_member_role(&env, &engagement.company, &company).is_some() {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "milestone_confirmed_by_member"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, company.clone()),
+            );
+        }
 
         if all_done {
             env.events().publish(
@@ -2417,7 +2442,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_company_disputer(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2472,6 +2497,17 @@ impl HireSettleContract {
             (Symbol::new(&env, "dispute_raised"), engagement_id.clone()),
             (milestone_index, reason),
         );
+        // Issue #575: identify the team member when the disputer is not the
+        // company itself.
+        if Self::company_member_role(&env, &engagement.company, &company).is_some() {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "dispute_raised_by_member"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, company.clone()),
+            );
+        }
     }
 
     // ----------------------------------------------------------
@@ -3631,6 +3667,106 @@ impl HireSettleContract {
             Some(c) => caller == &c,
             None => false,
         }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #575 — COMPANY TEAM MEMBERS
+    // ----------------------------------------------------------
+
+    /// Register a team member scoped to `company` with a role that grants a
+    /// subset of company-gated actions on every engagement of that company:
+    /// `Confirmer` may confirm milestones, `Disputer` may raise disputes.
+    /// Cancellation, top-ups, transfers and amendments stay company-only.
+    /// Only the company address itself may manage its members.
+    ///
+    /// # Events
+    /// `("company_member_added", company)` with `(member, role)`.
+    pub fn add_company_member(
+        env: Env,
+        company: Address,
+        member: Address,
+        role: CompanyMemberRole,
+    ) {
+        company.require_auth();
+        let key = DataKey::Config(ConfigKey::CompanyMember(company.clone(), member.clone()));
+        env.storage().persistent().set(&key, &role);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+        env.events().publish(
+            (Symbol::new(&env, "company_member_added"), company),
+            (member, role),
+        );
+    }
+
+    /// Remove a team member effective immediately: the address loses its
+    /// delegated rights on every engagement of the company at once. Removing
+    /// an address that is not a member is a no-op that still emits the event.
+    ///
+    /// # Events
+    /// `("company_member_removed", company)` with `member`.
+    pub fn remove_company_member(env: Env, company: Address, member: Address) {
+        company.require_auth();
+        env.storage().persistent().remove(&DataKey::Config(
+            ConfigKey::CompanyMember(company.clone(), member.clone()),
+        ));
+        env.events().publish(
+            (Symbol::new(&env, "company_member_removed"), company),
+            member,
+        );
+    }
+
+    /// Return the team role of `member` under `company`, or `None` if the
+    /// address is not a member.
+    pub fn get_company_member_role(
+        env: Env,
+        company: Address,
+        member: Address,
+    ) -> Option<CompanyMemberRole> {
+        Self::company_member_role(&env, &company, &member)
+    }
+
+    /// Internal helper: the team role of `member` under `company`, if any.
+    fn company_member_role(
+        env: &Env,
+        company: &Address,
+        member: &Address,
+    ) -> Option<CompanyMemberRole> {
+        env.storage().persistent().get(&DataKey::Config(
+            ConfigKey::CompanyMember(company.clone(), member.clone()),
+        ))
+    }
+
+    /// Whether `caller` may confirm milestones: the company itself, its
+    /// co-signer (full rights), or a team member with the `Confirmer` role.
+    fn is_company_confirmer(
+        env: &Env,
+        caller: &Address,
+        engagement_company: &Address,
+    ) -> bool {
+        if Self::is_authorized_company(env, caller, engagement_company) {
+            return true;
+        }
+        matches!(
+            Self::company_member_role(env, engagement_company, caller),
+            Some(CompanyMemberRole::Confirmer)
+        )
+    }
+
+    /// Whether `caller` may dispute milestones: the company itself, its
+    /// co-signer (full rights), or a team member with the `Disputer` role.
+    fn is_company_disputer(
+        env: &Env,
+        caller: &Address,
+        engagement_company: &Address,
+    ) -> bool {
+        if Self::is_authorized_company(env, caller, engagement_company) {
+            return true;
+        }
+        matches!(
+            Self::company_member_role(env, engagement_company, caller),
+            Some(CompanyMemberRole::Disputer)
+        )
     }
 
     // ----------------------------------------------------------
@@ -6415,7 +6551,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+        if !Self::is_company_confirmer(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -6503,6 +6639,17 @@ impl HireSettleContract {
                 ),
                 (idx, payment),
             );
+            // Issue #575: identify the team member when the confirmer is not
+            // the company itself.
+            if Self::company_member_role(&env, &engagement.company, &company).is_some() {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "milestone_confirmed_by_member"),
+                        engagement_id.clone(),
+                    ),
+                    (idx, company.clone()),
+                );
+            }
         }
 
         let all_done = (0..engagement.milestones.len()).all(|i| {
