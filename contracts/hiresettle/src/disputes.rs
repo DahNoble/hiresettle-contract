@@ -272,11 +272,79 @@ impl HireSettleContract {
             (Symbol::new(env, "dispute_raised"), engagement_id.clone()),
             (milestone_index, reason.clone()),
         );
+
+        // Issue #581: count the newly raised dispute against the company.
+        Self::record_dispute_raised_party(env, &engagement.company);
     }
 
     // ----------------------------------------------------------
-    // CAST ARBITER VOTE  (#10 multi-arbiter quorum)
+    // ISSUE #581 — DISPUTE STATISTICS PER PARTY
     // ----------------------------------------------------------
+
+    /// Load a party's dispute counters, defaulting to all zeros.
+    fn load_party_dispute_stats(env: &Env, party: &Address) -> DisputeStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::PartyDisputeStats(party.clone()))
+            .unwrap_or(DisputeStats {
+                disputes_raised: 0,
+                disputes_won: 0,
+                disputes_lost: 0,
+                escalations: 0,
+            })
+    }
+
+    fn store_party_dispute_stats(env: &Env, party: &Address, stats: &DisputeStats) {
+        let key = DataKey2::PartyDisputeStats(party.clone());
+        env.storage().persistent().set(&key, stats);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    /// Record a win (`won == true`) or loss for one party.
+    fn record_party_result(env: &Env, party: &Address, won: bool) {
+        let mut stats = Self::load_party_dispute_stats(env, party);
+        if won {
+            stats.disputes_won = stats.disputes_won.saturating_add(1);
+        } else {
+            stats.disputes_lost = stats.disputes_lost.saturating_add(1);
+        }
+        Self::store_party_dispute_stats(env, party, &stats);
+    }
+
+    /// Record a dispute outcome for both sides of an engagement.
+    /// `recruiter_won == true` means the milestone paid out (approve path);
+    /// `false` means it was withheld (reject path). The co-recruiter, when
+    /// present, is counted alongside the primary recruiter.
+    pub(crate) fn record_dispute_outcome(env: &Env, engagement: &Engagement, recruiter_won: bool) {
+        Self::record_party_result(env, &engagement.company, !recruiter_won);
+        Self::record_party_result(env, &engagement.recruiter, recruiter_won);
+        if let Some(co) = &engagement.co_recruiter {
+            Self::record_party_result(env, co, recruiter_won);
+        }
+    }
+
+    /// Count a newly raised dispute against the raising company.
+    pub(crate) fn record_dispute_raised_party(env: &Env, company: &Address) {
+        let mut stats = Self::load_party_dispute_stats(env, company);
+        stats.disputes_raised = stats.disputes_raised.saturating_add(1);
+        Self::store_party_dispute_stats(env, company, &stats);
+    }
+
+    /// Count an escalation against every party to the engagement.
+    pub(crate) fn record_dispute_escalation(env: &Env, engagement: &Engagement) {
+        for party in [&engagement.company, &engagement.recruiter] {
+            let mut stats = Self::load_party_dispute_stats(env, party);
+            stats.escalations = stats.escalations.saturating_add(1);
+            Self::store_party_dispute_stats(env, party, &stats);
+        }
+        if let Some(co) = &engagement.co_recruiter {
+            let mut stats = Self::load_party_dispute_stats(env, co);
+            stats.escalations = stats.escalations.saturating_add(1);
+            Self::store_party_dispute_stats(env, co, &stats);
+        }
+    }
 
     /// Each arbiter calls this to cast their vote on a Disputed milestone.
     /// The dispute resolves automatically once either:
@@ -388,8 +456,12 @@ impl HireSettleContract {
                 milestone_index,
                 &caller,
             );
+            // Issue #581: approve pays out — recruiter side wins.
+            Self::record_dispute_outcome(&env, &engagement, true);
         } else if record.reject_weight > total_weight - quorum {
             Self::finish_dispute_rejected(&env, &mut engagement, &engagement_id, milestone_index);
+            // Issue #581: reject withholds — company wins.
+            Self::record_dispute_outcome(&env, &engagement, false);
         } else {
             env.storage().persistent().set(&vote_key, &record);
             env.storage()
@@ -419,6 +491,8 @@ impl HireSettleContract {
         arbiter: Option<&Address>,
     ) {
         engagement.released_amount += payment;
+        // Issue #578: dispute payout releases escrow.
+        Self::add_token_locked(env, &engagement.token, -payment);
 
         let effective_bps = Self::payout_fee_bps(env, engagement_id, engagement);
         let platform_fee_amount =
@@ -1039,6 +1113,8 @@ impl HireSettleContract {
             ),
             (milestone_index, settled, released, withheld),
         );
+        // Issue #581: a majority-recruiter median counts as a recruiter win.
+        Self::record_dispute_outcome(env, engagement, settled >= 50);
         Self::finish_dispute_resolved(env, engagement, engagement_id, milestone_index, actor);
     }
 
@@ -1368,6 +1444,8 @@ impl HireSettleContract {
             &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
             &true,
         );
+        // Issue #581: count the escalation against every party.
+        Self::record_dispute_escalation(&env, &engagement);
         env.storage().persistent().extend_ttl(
             &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
             100_000,
@@ -1504,6 +1582,8 @@ impl HireSettleContract {
         if approve {
             let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
             engagement.released_amount += payment;
+            // Issue #578: dispute payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
             let platform_fee_amount =
@@ -1578,6 +1658,8 @@ impl HireSettleContract {
                 ),
                 (milestone_index, super_arbiter.clone(), true),
             );
+            // Issue #581: super arbiter approved — recruiter side wins.
+            Self::record_dispute_outcome(&env, &engagement, true);
             Self::emit_milestone_status_changed(
                 &env,
                 &engagement_id,
@@ -1632,6 +1714,8 @@ impl HireSettleContract {
                 ),
                 (milestone_index, super_arbiter.clone(), false),
             );
+            // Issue #581: super arbiter rejected — company wins.
+            Self::record_dispute_outcome(&env, &engagement, false);
             Self::emit_milestone_status_changed(
                 &env,
                 &engagement_id,
@@ -1740,6 +1824,8 @@ impl HireSettleContract {
 
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         engagement.released_amount += payment;
+        // Issue #578: dispute payout releases escrow.
+        Self::add_token_locked(&env, &engagement.token, -payment);
 
         let effective_bps = Self::payout_fee_bps(&env, &engagement_id, &engagement);
         let platform_fee_amount =
@@ -1799,6 +1885,8 @@ impl HireSettleContract {
             ),
             milestone_index,
         );
+        // Issue #581: timeout auto-favors the recruiter.
+        Self::record_dispute_outcome(&env, &engagement, true);
         Self::emit_milestone_status_changed(
             &env,
             &engagement_id,
@@ -2148,6 +2236,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
+        // Issue #578: payout releases escrow.
+        Self::add_token_locked(&env, &engagement.token, -payment);
 
         let token_client = token::Client::new(&env, &engagement.token);
         if fee_amount > 0 {
@@ -2538,6 +2628,8 @@ impl HireSettleContract {
                             milestone_index,
                             &actor,
                         );
+                        // Issue #581: enforced approve — recruiter side wins.
+                        Self::record_dispute_outcome(&env, &engagement, true);
                         true
                     } else if record.reject_weight > active_weight.saturating_sub(effective_quorum)
                     {
@@ -2547,6 +2639,8 @@ impl HireSettleContract {
                             &engagement_id,
                             milestone_index,
                         );
+                        // Issue #581: enforced reject — company wins.
+                        Self::record_dispute_outcome(&env, &engagement, false);
                         true
                     } else {
                         false

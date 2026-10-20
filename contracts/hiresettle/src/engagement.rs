@@ -456,6 +456,8 @@ impl HireSettleContract {
             let token_client = token::Client::new(&env, &token);
             token_client.transfer(&company, &env.current_contract_address(), &total_amount);
         }
+        // Issue #578: new engagement escrow locked (pool funds were never in TVL).
+        Self::add_token_locked(&env, &token, total_amount);
 
         // Issue #459: escrow the optional recruiter bond alongside the company's funding.
         if let Some(bond_amount) = config.recruiter_bond_amount {
@@ -616,6 +618,25 @@ impl HireSettleContract {
 
         env.storage().persistent().extend_ttl(
             &DataKey::RecruiterEngagements(recruiter.clone()),
+            100_000,
+            6_300_000,
+        );
+
+        // Issue #577: append engagement_id to the per-token index.
+        // Forward-only: engagements created before this deployment are not
+        // backfilled and never appear in this index.
+        let mut token_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TokenEngagements(engagement.token.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        token_ids.push_back(engagement_id.clone());
+        env.storage().persistent().set(
+            &DataKey2::TokenEngagements(engagement.token.clone()),
+            &token_ids,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey2::TokenEngagements(engagement.token.clone()),
             100_000,
             6_300_000,
         );
@@ -1125,6 +1146,8 @@ impl HireSettleContract {
         token_client.transfer(&company, &env.current_contract_address(), &amount);
 
         engagement.total_amount += amount;
+        // Issue #578: top-up locks more escrow.
+        Self::add_token_locked(&env, &engagement.token, amount);
         engagement.last_activity_ledger = env.ledger().sequence();
 
         env.storage()

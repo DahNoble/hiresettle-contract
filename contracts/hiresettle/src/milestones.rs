@@ -452,6 +452,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
+            // Issue #578: payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             let token_client = token::Client::new(&env, &engagement.token);
             if fee_amount > 0 {
@@ -966,6 +968,8 @@ impl HireSettleContract {
                 Self::platform_fee_amount(&env, &engagement_id, payment, effective_bps);
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
+            // Issue #578: payout releases escrow.
+            Self::add_token_locked(&env, &engagement.token, -payment);
 
             if fee_amount > 0 {
                 Self::collect_platform_fee(&env, &engagement, &engagement_id, idx, fee_amount);

@@ -211,6 +211,20 @@ pub struct ArbiterSetup {
     /// gives every arbiter a weight of 1, i.e. one-address-one-vote.
     pub weights: Option<Vec<u32>>,
 }
+/// Per-party dispute counters (issue #581): how often an address raises
+/// disputes, how many it wins/loses, and how many of its disputes escalate.
+#[contracttype]
+#[derive(Clone)]
+pub struct DisputeStats {
+    /// Disputes raised by this address (company side only; recruiters never raise).
+    pub disputes_raised: u32,
+    /// Disputes resolved in this address's favor.
+    pub disputes_won: u32,
+    /// Disputes resolved against this address.
+    pub disputes_lost: u32,
+    /// Disputes involving this address that were escalated to the super arbiter.
+    pub escalations: u32,
+}
 /// Returned by `get_arbiter_votes`.
 #[contracttype]
 #[derive(Clone)]
