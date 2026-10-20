@@ -604,6 +604,39 @@ impl HireSettleContract {
             .unwrap_or(0u32)
     }
 
+    /// Admin sets the share of each collected platform fee, in basis points,
+    /// paid to the engagement's referrer instead of the treasury (issue #543).
+    /// `0` (the default) sends the whole fee to the treasury.
+    ///
+    /// The share is only paid while the referrer is still on the recognised
+    /// referral list at payout time.
+    ///
+    /// # Panics
+    /// - `"InvalidReferrerFeeShareBps"` — `bps` exceeds 10 000.
+    ///
+    /// # Events
+    /// `("referrer_fee_share_set",)` with `bps`.
+    pub fn set_referrer_fee_share_bps(env: Env, admin: Address, bps: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if bps > FULL_SPLIT_BPS {
+            panic!("InvalidReferrerFeeShareBps");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Config(ConfigKey::ReferrerFeeShareBps), &bps);
+        env.events()
+            .publish((Symbol::new(&env, "referrer_fee_share_set"),), bps);
+    }
+
+    /// Return the referrer fee share in basis points (default 0).
+    pub fn get_referrer_fee_share_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::ReferrerFeeShareBps))
+            .unwrap_or(0u32)
+    }
+
     /// Return the discount, in basis points, currently applied for a given
     /// referrer (issue #312): the admin-configured discount if `referrer` is
     /// on the recognised referral list, or 0 if it is not (or the list is
